@@ -64,10 +64,14 @@ const SECONDS_PER_FRAME: f64 = (HOP_LENGTH as f64 * ENCODER_SUBSAMPLING as f64) 
 /// Maximum mel frames to send through the offline encoder in one call.
 ///
 /// Longer files are decoded successfully, but a single huge encoder input can
-/// exceed ONNX Runtime/model limits. Above this threshold we reuse the
-/// streaming pipeline and preserve the REST "full JSON response" contract.
+/// exceed ONNX Runtime/model limits. Above this threshold we split the file
+/// into offline chunks while preserving one REST "full JSON response".
 const OFFLINE_FULL_ENCODER_MAX_FRAMES: usize = 3000;
-const OFFLINE_STREAM_CHUNK_SAMPLES: usize = 16000;
+/// Offline chunk size for long REST/file transcriptions.
+///
+/// 20s keeps enough acoustic context for coherent decoding while staying well
+/// below the one-shot encoder threshold above.
+const OFFLINE_CHUNK_SAMPLES: usize = 16000 * 20;
 
 /// Default number of session triplets in the pool.
 #[cfg(target_os = "android")]
@@ -1095,35 +1099,38 @@ impl Engine {
         duration_s: f64,
         triplet: &mut SessionTriplet,
     ) -> Result<TranscribeResult, GigasttError> {
-        let mut state = self.create_state(false);
-        let mut final_segments = Vec::new();
+        let mut decoder_state = DecoderState::new(self.tokenizer.blank_id());
+        let mut frame_offset = 0usize;
+        let mut words = Vec::new();
 
-        for chunk in float_samples.chunks(OFFLINE_STREAM_CHUNK_SAMPLES) {
-            let segments = self.process_chunk(chunk, &mut state, triplet)?;
-            final_segments.extend(segments.into_iter().filter(|seg| seg.is_final));
+        for chunk in float_samples.chunks(OFFLINE_CHUNK_SAMPLES) {
+            let (features, num_frames) = self.features.compute(chunk);
+            tracing::info!(
+                chunk_samples = chunk.len(),
+                num_frames,
+                frame_offset,
+                "Extracted offline chunk mel frames"
+            );
+
+            let (mut chunk_words, _endpoint) = self
+                .run_inference(
+                    triplet,
+                    &features,
+                    num_frames,
+                    &mut decoder_state,
+                    frame_offset,
+                )
+                .map_err(|e| GigasttError::Inference { source: e.into() })?;
+
+            words.append(&mut chunk_words);
+            frame_offset += encoder_frame_offset_for_samples(chunk.len());
         }
 
-        if let Some(seg) = self.flush_state(&mut state) {
-            final_segments.push(seg);
-        }
-
-        let text = final_segments
+        let text = words
             .iter()
-            .filter_map(|seg| {
-                let trimmed = seg.text.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
+            .map(|w| w.word.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-
-        let mut words = Vec::new();
-        for seg in final_segments {
-            words.extend(seg.words);
-        }
 
         Ok(TranscribeResult {
             text,
@@ -1278,6 +1285,10 @@ fn estimate_mel_frames(sample_count: usize) -> usize {
     }
 }
 
+fn encoder_frame_offset_for_samples(sample_count: usize) -> usize {
+    estimate_mel_frames(sample_count) / ENCODER_SUBSAMPLING
+}
+
 /// Result of file transcription, including word-level details.
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscribeResult {
@@ -1327,6 +1338,20 @@ mod tests {
     fn test_decoder_state_custom_blank_id() {
         let state = DecoderState::new(42);
         assert_eq!(state.prev_token, 42);
+    }
+
+    #[test]
+    fn test_offline_chunk_size_stays_below_full_encoder_threshold() {
+        assert!(estimate_mel_frames(OFFLINE_CHUNK_SAMPLES) < OFFLINE_FULL_ENCODER_MAX_FRAMES);
+    }
+
+    #[test]
+    fn test_encoder_frame_offset_uses_subsampled_mel_frames() {
+        let sample_count = 16000;
+        assert_eq!(
+            encoder_frame_offset_for_samples(sample_count),
+            estimate_mel_frames(sample_count) / ENCODER_SUBSAMPLING
+        );
     }
 
     // ---- Pool tests (B.7) ---------------------------------------------------
