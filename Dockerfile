@@ -6,6 +6,7 @@
 FROM rust:1.88-bookworm AS builder
 
 ARG ORT_VERSION=1.24.2
+ARG ORT_ARCHIVE_URL=
 
 # `prost-build` (via build.rs) requires `protoc` at compile time; without it
 # the build aborts with "prost-build failed to compile proto/onnx.proto".
@@ -17,7 +18,20 @@ WORKDIR /build
 
 # Avoid ort-sys' CDN downloader during Docker builds. The official Microsoft
 # ONNX Runtime release archive supplies the dynamic library that ort links to.
-RUN curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" -o /tmp/onnxruntime.tgz && \
+# GitHub Releases can be flaky from some servers, so fail stalled connections
+# quickly and retry. ORT_ARCHIVE_URL allows using an internal mirror if needed.
+RUN archive_url="${ORT_ARCHIVE_URL:-https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz}" && \
+    curl -4 -fsSL \
+      --connect-timeout 30 \
+      --max-time 600 \
+      --retry 8 \
+      --retry-delay 5 \
+      --retry-max-time 1800 \
+      --retry-all-errors \
+      --speed-limit 1024 \
+      --speed-time 60 \
+      "$archive_url" \
+      -o /tmp/onnxruntime.tgz && \
     mkdir -p /opt/onnxruntime && \
     tar -xzf /tmp/onnxruntime.tgz -C /opt/onnxruntime --strip-components=1 && \
     rm /tmp/onnxruntime.tgz

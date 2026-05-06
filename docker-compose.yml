@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      network: host
     image: gigastt:local
     container_name: gigastt
     restart: unless-stopped
