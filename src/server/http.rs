@@ -5,7 +5,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{Html, IntoResponse, Json, Response};
 use futures_util::StreamExt;
 use futures_util::stream::Stream;
 use serde::Serialize;
@@ -14,6 +14,39 @@ use std::sync::Arc;
 use super::metrics::MetricsRegistry;
 use super::{RuntimeLimits, pool_retry_after_ms, pool_retry_after_secs};
 use crate::inference::Engine;
+
+const OPENAPI_YAML: &str = include_str!("../../docs/openapi.yaml");
+
+const SWAGGER_UI_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gigastt API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+  <style>
+    body { margin: 0; background: #fff; }
+    .swagger-ui .topbar { display: none; }
+  </style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.onload = function () {
+      window.ui = SwaggerUIBundle({
+        url: "/openapi.yaml",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        displayRequestDuration: true,
+        persistAuthorization: true,
+        tryItOutEnabled: true
+      });
+    };
+  </script>
+</body>
+</html>
+"##;
 
 /// Shared application state for all handlers. Carries runtime limits so the
 /// WebSocket path can enforce configurable frame / idle bounds without
@@ -55,6 +88,21 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// GET /openapi.yaml — OpenAPI document for Swagger UI and client generation.
+pub async fn openapi_yaml() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/yaml; charset=utf-8")],
+        OPENAPI_YAML,
+    )
+        .into_response()
+}
+
+/// GET /swagger, /swagger/, /docs — Swagger UI for the REST API.
+pub async fn swagger_ui() -> Html<&'static str> {
+    Html(SWAGGER_UI_HTML)
 }
 
 /// Health check response.
@@ -290,7 +338,7 @@ pub async fn transcribe(
         }
         Ok((Err(e), triplet)) => {
             reservation.checkin(triplet);
-            tracing::error!("Transcription error: {e}");
+            tracing::error!("Transcription error: {e:#}");
             Err(api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Transcription failed. Check audio format.",

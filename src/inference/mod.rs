@@ -61,6 +61,13 @@ pub(crate) fn now_timestamp() -> f64 {
 const ENCODER_SUBSAMPLING: usize = 4;
 /// Seconds per encoder frame (HOP_LENGTH * ENCODER_SUBSAMPLING / 16000 = 0.04s).
 const SECONDS_PER_FRAME: f64 = (HOP_LENGTH as f64 * ENCODER_SUBSAMPLING as f64) / 16000.0;
+/// Maximum mel frames to send through the offline encoder in one call.
+///
+/// Longer files are decoded successfully, but a single huge encoder input can
+/// exceed ONNX Runtime/model limits. Above this threshold we reuse the
+/// streaming pipeline and preserve the REST "full JSON response" contract.
+const OFFLINE_FULL_ENCODER_MAX_FRAMES: usize = 3000;
+const OFFLINE_STREAM_CHUNK_SAMPLES: usize = 16000;
 
 /// Default number of session triplets in the pool.
 #[cfg(target_os = "android")]
@@ -1027,6 +1034,15 @@ impl Engine {
         triplet: &mut SessionTriplet,
     ) -> Result<TranscribeResult, GigasttError> {
         let duration_s = float_samples.len() as f64 / 16000.0;
+        let estimated_frames = estimate_mel_frames(float_samples.len());
+        if estimated_frames > OFFLINE_FULL_ENCODER_MAX_FRAMES {
+            tracing::info!(
+                estimated_frames,
+                threshold = OFFLINE_FULL_ENCODER_MAX_FRAMES,
+                "Long audio detected, using chunked offline transcription"
+            );
+            return self.transcribe_samples_chunked(float_samples, duration_s, triplet);
+        }
 
         let (features, num_frames) = self.features.compute(float_samples);
         tracing::info!("Extracted {} mel frames", num_frames);
@@ -1065,6 +1081,49 @@ impl Engine {
             .map(|w| w.word.as_str())
             .collect::<Vec<_>>()
             .join(" ");
+
+        Ok(TranscribeResult {
+            text,
+            words,
+            duration_s,
+        })
+    }
+
+    fn transcribe_samples_chunked(
+        &self,
+        float_samples: &[f32],
+        duration_s: f64,
+        triplet: &mut SessionTriplet,
+    ) -> Result<TranscribeResult, GigasttError> {
+        let mut state = self.create_state(false);
+        let mut final_segments = Vec::new();
+
+        for chunk in float_samples.chunks(OFFLINE_STREAM_CHUNK_SAMPLES) {
+            let segments = self.process_chunk(chunk, &mut state, triplet)?;
+            final_segments.extend(segments.into_iter().filter(|seg| seg.is_final));
+        }
+
+        if let Some(seg) = self.flush_state(&mut state) {
+            final_segments.push(seg);
+        }
+
+        let text = final_segments
+            .iter()
+            .filter_map(|seg| {
+                let trimmed = seg.text.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let mut words = Vec::new();
+        for seg in final_segments {
+            words.extend(seg.words);
+        }
 
         Ok(TranscribeResult {
             text,
@@ -1208,6 +1267,14 @@ impl Engine {
         }
 
         words
+    }
+}
+
+fn estimate_mel_frames(sample_count: usize) -> usize {
+    if sample_count < N_FFT {
+        1
+    } else {
+        (sample_count - N_FFT) / HOP_LENGTH + 1
     }
 }
 

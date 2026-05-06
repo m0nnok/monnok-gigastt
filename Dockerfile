@@ -3,15 +3,27 @@
 # Run:   docker run -p 9876:9876 gigastt
 
 # --- Builder stage ---
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
+
+ARG ORT_VERSION=1.24.2
 
 # `prost-build` (via build.rs) requires `protoc` at compile time; without it
 # the build aborts with "prost-build failed to compile proto/onnx.proto".
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends protobuf-compiler && \
+    apt-get install -y --no-install-recommends ca-certificates curl protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+
+# Avoid ort-sys' CDN downloader during Docker builds. The official Microsoft
+# ONNX Runtime release archive supplies the dynamic library that ort links to.
+RUN curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" -o /tmp/onnxruntime.tgz && \
+    mkdir -p /opt/onnxruntime && \
+    tar -xzf /tmp/onnxruntime.tgz -C /opt/onnxruntime --strip-components=1 && \
+    rm /tmp/onnxruntime.tgz
+
+ENV ORT_LIB_LOCATION=/opt/onnxruntime/lib
+ENV ORT_PREFER_DYNAMIC_LINK=1
 
 # Dependency-compilation cache: copy manifests + build.rs + proto/ first and
 # compile a dummy binary so `cargo build` downloads + builds every transitive
@@ -19,11 +31,14 @@ WORKDIR /build
 # layer, cutting incremental rebuild time from minutes to seconds.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto/ proto/
-RUN mkdir -p src && \
+COPY docs/openapi.yaml docs/openapi.yaml
+RUN mkdir -p src tests && \
     echo 'fn main() {}' > src/main.rs && \
     touch src/lib.rs && \
+    touch tests/benchmark.rs && \
     cargo build --release && \
-    rm -rf src target/release/deps/gigastt-* target/release/gigastt*
+    cargo clean -p gigastt --release && \
+    rm -rf src
 
 # Now bring in the actual source and build the real binary.
 COPY src/ src/
@@ -41,6 +56,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/gigastt /usr/local/bin/gigastt
+COPY --from=builder /opt/onnxruntime/lib/libonnxruntime.so* /usr/local/lib/
+RUN ldconfig
 
 RUN mkdir -p /models && \
     if [ "$GIGASTT_BAKE_MODEL" = "1" ]; then \
@@ -57,6 +74,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/gigastt /usr/local/bin/gigastt
+COPY --from=builder /opt/onnxruntime/lib/libonnxruntime.so* /usr/local/lib/
+RUN ldconfig
 
 RUN groupadd -r gigastt && useradd -r -g gigastt gigastt && \
     mkdir -p /home/gigastt/.gigastt/models && chown -R gigastt:gigastt /home/gigastt
@@ -67,6 +86,7 @@ COPY --from=model-fetcher --chown=gigastt:gigastt /models/. /home/gigastt/.gigas
 USER gigastt
 
 ENV RUST_LOG=gigastt=info
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
 EXPOSE 9876
 

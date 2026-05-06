@@ -11,7 +11,7 @@ FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS builder
 # baseline toolchain needed to compile the crate + its C deps.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl build-essential pkg-config protobuf-compiler && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0 && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0 && \
     rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -21,11 +21,14 @@ WORKDIR /build
 # Dependency-compilation cache (see Dockerfile for rationale).
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto/ proto/
-RUN mkdir -p src && \
+COPY docs/openapi.yaml docs/openapi.yaml
+RUN mkdir -p src tests && \
     echo 'fn main() {}' > src/main.rs && \
     touch src/lib.rs && \
+    touch tests/benchmark.rs && \
     cargo build --release --features cuda && \
-    rm -rf src target/release/deps/gigastt-* target/release/gigastt*
+    cargo clean -p gigastt --release && \
+    rm -rf src
 
 COPY src/ src/
 

@@ -450,6 +450,10 @@ pub async fn run_with_config_listener(
 
     let app = Router::new()
         .route("/health", get(http::health))
+        .route("/openapi.yaml", get(http::openapi_yaml))
+        .route("/swagger", get(http::swagger_ui))
+        .route("/swagger/", get(http::swagger_ui))
+        .route("/docs", get(http::swagger_ui))
         .merge(protected)
         .layer(DefaultBodyLimit::max(config.limits.body_limit_bytes))
         .layer(origin_layer)
@@ -458,6 +462,7 @@ pub async fn run_with_config_listener(
     tracing::info!("gigastt server listening on http://{addr}");
     tracing::info!("  WebSocket: ws://{addr}/v1/ws (legacy alias: ws://{addr}/ws)");
     tracing::info!("  REST API:  http://{addr}/health, /v1/transcribe, /v1/transcribe/stream");
+    tracing::info!("  Swagger:   http://{addr}/swagger");
     if config.origin_policy.allow_any {
         tracing::warn!(
             "CORS allow-any is ON: any cross-origin page can call this server. \

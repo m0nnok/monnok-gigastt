@@ -24,7 +24,8 @@ benches/
 missions/
 
 # Docs & specs
-docs/
+docs/*
+!docs/openapi.yaml
 specs/
 CHANGELOG.md
 CONTRIBUTING.md
