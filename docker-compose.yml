@@ -11,6 +11,7 @@ services:
     environment:
       RUST_LOG: gigastt=info
       GIGASTT_ORT_INTRA_THREADS: "8"
+      GIGASTT_DIARIZATION: "true"
     volumes:
       - gigastt-models:/home/gigastt/.gigastt/models
     healthcheck:

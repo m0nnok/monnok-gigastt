@@ -9,14 +9,11 @@ mod tokenizer;
 
 #[cfg(feature = "diarization")]
 use polyvoice::{
-    DiarizationConfig as DiaConfig, OfflineDiarizer, OnlineDiarizer, OnnxEmbeddingExtractor,
-    SampleRate,
+    DiarizationConfig as DiaConfig, FbankOnnxExtractor, OfflineDiarizer, OnlineDiarizer, SampleRate,
 };
 
 #[cfg(feature = "diarization")]
 const SPEAKER_EMBEDDING_DIM: usize = 256;
-#[cfg(feature = "diarization")]
-const SPEAKER_SEGMENT_SAMPLES: usize = 24000;
 #[cfg(feature = "diarization")]
 const SPEAKER_POOL_SIZE: usize = 4;
 
@@ -545,7 +542,7 @@ pub struct Engine {
     int8: bool,
     /// Speaker encoder for diarization (None if model file is absent).
     #[cfg(feature = "diarization")]
-    pub speaker_encoder: Option<OnnxEmbeddingExtractor>,
+    pub speaker_encoder: Option<FbankOnnxExtractor>,
 }
 
 impl Engine {
@@ -793,13 +790,12 @@ impl Engine {
         #[cfg(feature = "diarization")]
         let speaker_encoder = {
             let model_path = dir.join("wespeaker_resnet34.onnx");
-            if model_path.exists() {
-                match OnnxEmbeddingExtractor::new(
-                    &model_path,
-                    SPEAKER_EMBEDDING_DIM,
-                    SPEAKER_SEGMENT_SAMPLES,
-                    SPEAKER_POOL_SIZE,
-                ) {
+            if !diarization_enabled_from_env() {
+                tracing::info!("Speaker diarization disabled by GIGASTT_DIARIZATION");
+                None
+            } else if model_path.exists() {
+                match FbankOnnxExtractor::new(&model_path, SPEAKER_EMBEDDING_DIM, SPEAKER_POOL_SIZE)
+                {
                     Ok(enc) => {
                         tracing::info!("Speaker encoder loaded (diarization available)");
                         Some(enc)
@@ -1065,27 +1061,7 @@ impl Engine {
             .map_err(|e| GigasttError::Inference { source: e.into() })?;
 
         #[cfg(feature = "diarization")]
-        if let Some(ref enc) = self.speaker_encoder {
-            let config = DiaConfig::default();
-            let diarizer = OfflineDiarizer::new(config);
-            match diarizer.run(float_samples, enc) {
-                Ok(dia_result) => {
-                    for word in &mut words {
-                        let mid = (word.start + word.end) / 2.0;
-                        if let Some(turn) = dia_result
-                            .turns
-                            .iter()
-                            .find(|t| t.time.start <= mid && t.time.end >= mid)
-                        {
-                            word.speaker = Some(turn.speaker.0);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Offline diarization failed: {e:#}");
-                }
-            }
-        }
+        self.apply_offline_diarization(float_samples, &mut words);
 
         let text: String = words
             .iter()
@@ -1133,6 +1109,9 @@ impl Engine {
             frame_offset += encoder_frame_offset_for_samples(chunk.len());
         }
 
+        #[cfg(feature = "diarization")]
+        self.apply_offline_diarization(float_samples, &mut words);
+
         let text = words
             .iter()
             .map(|w| w.word.as_str())
@@ -1144,6 +1123,33 @@ impl Engine {
             words,
             duration_s,
         })
+    }
+
+    #[cfg(feature = "diarization")]
+    fn apply_offline_diarization(&self, float_samples: &[f32], words: &mut [WordInfo]) {
+        let Some(ref enc) = self.speaker_encoder else {
+            return;
+        };
+
+        let config = DiaConfig::default();
+        let diarizer = OfflineDiarizer::new(config);
+        match diarizer.run(float_samples, enc) {
+            Ok(dia_result) => {
+                for word in words {
+                    let mid = (word.start + word.end) / 2.0;
+                    if let Some(turn) = dia_result
+                        .turns
+                        .iter()
+                        .find(|t| t.time.start <= mid && t.time.end >= mid)
+                    {
+                        word.speaker = Some(turn.speaker.0);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Offline diarization failed: {e:#}");
+            }
+        }
     }
 
     fn run_inference(
@@ -1307,6 +1313,23 @@ fn parse_ort_intra_threads(value: Option<&str>) -> usize {
     }
 }
 
+#[cfg(feature = "diarization")]
+fn diarization_enabled_from_env() -> bool {
+    parse_env_flag(std::env::var("GIGASTT_DIARIZATION").ok().as_deref(), true)
+}
+
+#[cfg(feature = "diarization")]
+fn parse_env_flag(value: Option<&str>, default: bool) -> bool {
+    match value {
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        None => default,
+    }
+}
+
 /// Result of file transcription, including word-level details.
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscribeResult {
@@ -1384,6 +1407,23 @@ mod tests {
     fn test_parse_ort_intra_threads_accepts_positive_values() {
         assert_eq!(parse_ort_intra_threads(Some("8")), 8);
         assert_eq!(parse_ort_intra_threads(Some(" 12 ")), 12);
+    }
+
+    #[cfg(feature = "diarization")]
+    #[test]
+    fn test_parse_env_flag_accepts_common_boolean_values() {
+        assert!(parse_env_flag(None, true));
+        assert!(!parse_env_flag(None, false));
+        assert!(parse_env_flag(Some("1"), false));
+        assert!(parse_env_flag(Some("true"), false));
+        assert!(parse_env_flag(Some("YES"), false));
+        assert!(parse_env_flag(Some("on"), false));
+        assert!(!parse_env_flag(Some("0"), true));
+        assert!(!parse_env_flag(Some("false"), true));
+        assert!(!parse_env_flag(Some("NO"), true));
+        assert!(!parse_env_flag(Some("off"), true));
+        assert!(parse_env_flag(Some("garbage"), true));
+        assert!(!parse_env_flag(Some("garbage"), false));
     }
 
     // ---- Pool tests (B.7) ---------------------------------------------------

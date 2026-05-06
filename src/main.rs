@@ -221,6 +221,17 @@ fn is_loopback_host(host: &str) -> bool {
     false
 }
 
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
 /// Ensure the INT8 encoder exists, producing it via the native Rust
 /// quantization pipeline if missing. Honoured by `serve` and `download`.
 /// First-time quantization takes ~2 minutes on the 844 MB FP32 encoder.
@@ -280,6 +291,14 @@ async fn main() -> anyhow::Result<()> {
         } => {
             ensure_bind_allowed(&host, bind_all)?;
             model::ensure_model(&model_dir).await?;
+            #[cfg(feature = "diarization")]
+            {
+                if env_flag_enabled("GIGASTT_DIARIZATION", true) {
+                    model::ensure_speaker_model(&model_dir).await?;
+                } else {
+                    tracing::info!("Speaker diarization disabled by GIGASTT_DIARIZATION");
+                }
+            }
             ensure_int8_encoder(&model_dir, skip_quantize)?;
             let engine = inference::Engine::load_with_pool_size(&model_dir, pool_size)?;
             log_rss();
@@ -393,5 +412,33 @@ mod tests {
     #[test]
     fn test_ensure_bind_allowed_explicit_flag_ok() {
         ensure_bind_allowed("0.0.0.0", true).expect("explicit --bind-all must pass");
+    }
+
+    #[test]
+    fn test_env_flag_enabled_parses_common_values() {
+        const NAME: &str = "GIGASTT_TEST_FLAG";
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+        assert!(env_flag_enabled(NAME, true));
+        assert!(!env_flag_enabled(NAME, false));
+
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            unsafe {
+                std::env::set_var(NAME, value);
+            }
+            assert!(env_flag_enabled(NAME, false));
+        }
+
+        for value in ["0", "false", "FALSE", "no", "off"] {
+            unsafe {
+                std::env::set_var(NAME, value);
+            }
+            assert!(!env_flag_enabled(NAME, true));
+        }
+
+        unsafe {
+            std::env::remove_var(NAME);
+        }
     }
 }
