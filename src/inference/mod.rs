@@ -593,6 +593,8 @@ impl Engine {
     fn load_sessions(
         dir: &Path,
         prepacked: &ort::session::builder::PrepackedWeights,
+        #[cfg_attr(any(feature = "coreml", feature = "cuda"), allow(unused_variables))]
+        ort_intra_threads: usize,
     ) -> anyhow::Result<(Session, Session, Session)> {
         let encoder_path = if dir.join("v3_e2e_rnnt_encoder_int8.onnx").exists() {
             dir.join("v3_e2e_rnnt_encoder_int8.onnx")
@@ -691,7 +693,7 @@ impl Engine {
                 .map_err(ort_err)?
                 .with_prepacked_weights(prepacked)
                 .map_err(ort_err)?
-                .with_intra_threads(1)
+                .with_intra_threads(ort_intra_threads)
                 .map_err(ort_err)?
                 .with_inter_threads(1)
                 .map_err(ort_err)?
@@ -740,7 +742,11 @@ impl Engine {
         #[cfg(feature = "cuda")]
         tracing::info!("Using CUDA execution provider (falls back to CPU if unavailable)");
         #[cfg(not(any(feature = "coreml", feature = "cuda")))]
-        tracing::info!("Using CPU execution provider");
+        let ort_intra_threads = ort_intra_threads_from_env();
+        #[cfg(not(any(feature = "coreml", feature = "cuda")))]
+        tracing::info!(ort_intra_threads, "Using CPU execution provider");
+        #[cfg(any(feature = "coreml", feature = "cuda"))]
+        let ort_intra_threads = 1;
 
         // Shared prepacked weights container (Arc-based, thread-safe)
         let prepacked = ort::session::builder::PrepackedWeights::new();
@@ -755,7 +761,8 @@ impl Engine {
                                 "Loading session triplet {}/{pool_size} (shared weights)",
                                 i + 1
                             );
-                            let (encoder, decoder, joiner) = Self::load_sessions(dir, pp)?;
+                            let (encoder, decoder, joiner) =
+                                Self::load_sessions(dir, pp, ort_intra_threads)?;
                             Ok(SessionTriplet {
                                 encoder,
                                 decoder,
@@ -1289,6 +1296,17 @@ fn encoder_frame_offset_for_samples(sample_count: usize) -> usize {
     estimate_mel_frames(sample_count) / ENCODER_SUBSAMPLING
 }
 
+fn ort_intra_threads_from_env() -> usize {
+    parse_ort_intra_threads(std::env::var("GIGASTT_ORT_INTRA_THREADS").ok().as_deref())
+}
+
+fn parse_ort_intra_threads(value: Option<&str>) -> usize {
+    match value.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(threads) if threads > 0 => threads,
+        _ => 1,
+    }
+}
+
 /// Result of file transcription, including word-level details.
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscribeResult {
@@ -1352,6 +1370,20 @@ mod tests {
             encoder_frame_offset_for_samples(sample_count),
             estimate_mel_frames(sample_count) / ENCODER_SUBSAMPLING
         );
+    }
+
+    #[test]
+    fn test_parse_ort_intra_threads_defaults_to_one() {
+        assert_eq!(parse_ort_intra_threads(None), 1);
+        assert_eq!(parse_ort_intra_threads(Some("")), 1);
+        assert_eq!(parse_ort_intra_threads(Some("0")), 1);
+        assert_eq!(parse_ort_intra_threads(Some("not-a-number")), 1);
+    }
+
+    #[test]
+    fn test_parse_ort_intra_threads_accepts_positive_values() {
+        assert_eq!(parse_ort_intra_threads(Some("8")), 8);
+        assert_eq!(parse_ort_intra_threads(Some(" 12 ")), 12);
     }
 
     // ---- Pool tests (B.7) ---------------------------------------------------

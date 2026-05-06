@@ -1,0 +1,24 @@
+services:
+  gigastt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gigastt:local
+    container_name: gigastt
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9876:9876"
+    environment:
+      RUST_LOG: gigastt=info
+      GIGASTT_ORT_INTRA_THREADS: "8"
+    volumes:
+      - gigastt-models:/home/gigastt/.gigastt/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9876/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  gigastt-models:
+    name: gigastt-models
