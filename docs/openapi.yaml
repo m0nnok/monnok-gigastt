@@ -61,10 +61,8 @@ info:
     url: https://github.com/ekhodzitsky/gigastt
 
 servers:
-  - url: http://127.0.0.1:9876
-    description: Local development server (default)
-  - url: http://0.0.0.0:9876
-    description: Docker container
+  - url: /
+    description: Current server
 
 paths:
   /health:

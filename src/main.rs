@@ -49,7 +49,12 @@ enum Commands {
         /// Additional Origin allowed to call the REST / WebSocket API (repeatable).
         /// Loopback origins (localhost, 127.0.0.1, ::1) are always allowed.
         /// Match is exact and case-insensitive, e.g. `https://app.example.com`.
-        #[arg(long = "allow-origin", value_name = "URL")]
+        #[arg(
+            long = "allow-origin",
+            value_name = "URL",
+            env = "GIGASTT_ALLOW_ORIGIN",
+            value_delimiter = ','
+        )]
         allow_origin: Vec<String>,
 
         /// Echo `Access-Control-Allow-Origin: *` and accept any cross-origin

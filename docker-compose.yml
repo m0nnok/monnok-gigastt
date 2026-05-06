@@ -13,6 +13,7 @@ services:
       RUST_LOG: gigastt=info
       GIGASTT_ORT_INTRA_THREADS: "8"
       GIGASTT_DIARIZATION: "true"
+      GIGASTT_ALLOW_ORIGIN: ${GIGASTT_ALLOW_ORIGIN}
     volumes:
       - gigastt-models:/home/gigastt/.gigastt/models
     healthcheck:
