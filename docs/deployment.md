@@ -100,7 +100,15 @@ server {
         # the real peer address only.
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 600s;
+
+        # Long-audio settings — see "Long audio behind a proxy" below.
+        client_max_body_size     300m;
+        client_body_timeout      300s;
+        proxy_max_temp_file_size 1024m;
+        proxy_connect_timeout    60s;
+        proxy_send_timeout       3600s;
+        proxy_read_timeout       3600s;
+        send_timeout             3600s;
     }
 
     # Optional: redirect HTTP to HTTPS
@@ -134,9 +142,89 @@ sudo nginx -t && sudo systemctl reload nginx
 
 **Why these settings:**
 - `proxy_http_version 1.1` + `Upgrade`/`Connection` headers handle WebSocket upgrade
-- `proxy_read_timeout 600s` — transcribing 10 minutes of audio takes time
+- `proxy_read_timeout 3600s` — `POST /v1/transcribe` is synchronous and sends
+  nothing until the whole transcript is ready, so this is the timeout that
+  produces mystery 504s on long files. See below.
 - `X-Forwarded-For $remote_addr` (overwrite, not append) — see warning below for the rate-limiter implications
 - `$connection_upgrade` map prevents connection pooling on HTTP/1.0
+
+## Long audio behind a proxy
+
+`POST /v1/transcribe` is synchronous: it holds the connection open and emits
+nothing until the full transcript is ready. On CPU, an hour of audio realistically
+takes 10–30 minutes, so every timeout between the client and gigastt has to be
+larger than that or the request dies before the answer exists.
+
+**Server defaults** (all overridable):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `--max-audio-duration-s` | 3900 (65 min) | Longest file accepted; rejected during decode with 422 `audio_too_long` |
+| `--body-limit-bytes` | 256 MiB | Largest upload; rejected with 413 `payload_too_large` |
+| `--max-inference-secs` | 1800 (30 min) | Wall-clock budget per transcription; 504 `inference_timeout` |
+| `--pool-checkout-timeout-secs` | 300 | Wait for a free session before 503 + `Retry-After` |
+| `--max-concurrent-uploads` | 0 → `pool_size * 2` | Uploads admitted at once; bounds peak RSS |
+
+Clients can read `max_audio_duration_s` and `max_body_bytes` from `GET /v1/models`
+and check a file locally instead of uploading it to find out.
+
+**Nginx Proxy Manager** — put this in *Advanced → Custom Nginx Configuration* for
+the proxy host:
+
+```nginx
+client_max_body_size      300m;   # must be >= --body-limit-bytes
+client_body_timeout       300s;
+proxy_request_buffering   on;     # nginx default; keep it
+proxy_max_temp_file_size  1024m;
+proxy_connect_timeout     60s;
+proxy_send_timeout        3600s;
+proxy_read_timeout        3600s;  # the one that matters
+send_timeout              3600s;
+```
+
+- `proxy_read_timeout` is an *idle-between-reads* timeout on the upstream socket.
+  Because the synchronous endpoint stays silent for the whole job, it must exceed
+  `pool_checkout_timeout_secs + max_inference_secs` (300 + 1800 = 2100 s). 3600 s
+  leaves headroom.
+- Keep `proxy_request_buffering on`. nginx spools the body to a temp file first,
+  so the `proxy_read_timeout` clock does not start until the upload finishes and
+  a slow uploader cannot occupy a gigastt session slot. The cost is temp-file
+  space inside the proxy container (`proxy_max_temp_file_size`).
+- NPM's **Block Common Exploits** toggle and the global `client_max_body_size` in
+  `/data/nginx/` both override per-host settings. A 413 with an nginx-branded
+  HTML body comes from there, not from gigastt.
+- **Cloudflare in front of the proxy is a hard blocker**: the 100 s origin
+  timeout on Free/Pro plans cannot be raised, so synchronous hour-long
+  transcription cannot complete through it.
+
+**Client timeouts.** Most HTTP clients default well below the job length —
+.NET's `HttpClient.Timeout` is 100 seconds and covers reading the response body,
+so it will always fire on a long file until raised. Set the client deadline
+*above* `pool_checkout_timeout_secs + max_inference_secs` so the server's own
+503/504 with `Retry-After` reaches the caller instead of a blind client-side
+timeout. Send the body with a known length (`Content-Length`) so nginx can reject
+an oversized upload from the headers rather than after transferring it all.
+
+**Memory.** Peak RSS is roughly:
+
+```
+models (~600 MB) + in_flight × (body_limit_bytes + 4 bytes × 16000 × max_audio_duration_s)
+```
+
+With the defaults and a 4-slot pool that is ~2.6 GB, so **provision at least
+4 GB**. The `4 × 16000 × duration` term is the decoded 16 kHz buffer (230 MB for
+an hour); it no longer scales with the *source* sample rate, because decoding
+resamples in fixed windows rather than buffering the whole file at its original
+rate.
+
+**Uncompressed stereo is deliberately not covered** by the 256 MiB default: an
+hour of 48 kHz stereo WAV is ~659 MiB, and accepting that per request across the
+pool is not a defensible default. Downmix or compress client-side:
+
+```sh
+ffmpeg -i call.wav -ac 1 -ar 16000 -c:a pcm_s16le call-16k.wav   # ~110 MiB/hour
+ffmpeg -i call.wav -ac 1 -c:a libopus -b:a 32k call.opus         # ~14 MiB/hour
+```
 
 ## Rate-limiter & X-Forwarded-For (V1-11)
 

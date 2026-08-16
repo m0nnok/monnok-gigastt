@@ -263,10 +263,16 @@ Downloaded to `~/.gigastt/models/` from `istupakov/gigaam-v3-onnx`:
 - **Runtime limits** (all configurable via CLI flags and env vars):
   - `--idle-timeout-secs` (default 300) — WebSocket idle timeout
   - `--ws-frame-max-bytes` (default 512 KiB) — max WS frame size
-  - `--body-limit-bytes` (default 50 MiB) — max REST body size
+  - `--body-limit-bytes` (default 256 MiB) — max REST body size
   - `--pool-size` (default 4) — concurrent inference sessions
   - `--max-session-secs` (default 3600) — wall-clock session cap
   - `--shutdown-drain-secs` (default 10) — graceful shutdown drain window
+  - `--pool-checkout-timeout-secs` (default 300) — wait for a free session
+  - `--max-audio-duration-s` (default 3900 = 65 min) — max audio length
+  - `--max-inference-secs` (default 1800) — wall-clock budget per transcription
+  - `--max-concurrent-uploads` (default 0 → `pool_size * 2`) — upload admission
+    control; this, not the pool, is what bounds peak memory, because axum
+    buffers each request body whole before the handler runs
 - **Per-IP rate limiting** (opt-in, off by default): `--rate-limit-per-minute N`
   enables token-bucket limiter on `/v1/*`; `/health` is exempt. Returns HTTP 429
   + `Retry-After` when exhausted.
@@ -306,7 +312,11 @@ All CLI flags have corresponding env vars:
 | `GIGASTT_ALLOW_BIND_ANY` | `--bind-all` | — |
 | `GIGASTT_IDLE_TIMEOUT_SECS` | `--idle-timeout-secs` | 300 |
 | `GIGASTT_WS_FRAME_MAX_BYTES` | `--ws-frame-max-bytes` | 524288 |
-| `GIGASTT_BODY_LIMIT_BYTES` | `--body-limit-bytes` | 52428800 |
+| `GIGASTT_BODY_LIMIT_BYTES` | `--body-limit-bytes` | 268435456 |
+| `GIGASTT_MAX_AUDIO_DURATION_S` | `--max-audio-duration-s` | 3900 |
+| `GIGASTT_MAX_INFERENCE_SECS` | `--max-inference-secs` | 1800 |
+| `GIGASTT_MAX_CONCURRENT_UPLOADS` | `--max-concurrent-uploads` | 0 |
+| `GIGASTT_POOL_CHECKOUT_TIMEOUT_SECS` | `--pool-checkout-timeout-secs` | 300 |
 | `GIGASTT_RATE_LIMIT_PER_MINUTE` | `--rate-limit-per-minute` | 0 |
 | `GIGASTT_RATE_LIMIT_BURST` | `--rate-limit-burst` | 10 |
 | `GIGASTT_MAX_SESSION_SECS` | `--max-session-secs` | 3600 |

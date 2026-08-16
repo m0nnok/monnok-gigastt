@@ -72,9 +72,34 @@ enum Commands {
         #[arg(long, env = "GIGASTT_WS_FRAME_MAX_BYTES", default_value_t = 512 * 1024)]
         ws_frame_max_bytes: usize,
 
-        /// Maximum REST request body size (bytes).
-        #[arg(long, env = "GIGASTT_BODY_LIMIT_BYTES", default_value_t = 50 * 1024 * 1024)]
+        /// Maximum REST request body size (bytes). Default 256 MiB, which
+        /// covers an hour of compressed audio or 16 kHz mono WAV. Raise it only
+        /// alongside `--max-concurrent-uploads`, which is what actually bounds
+        /// how many bodies of this size can be in flight at once.
+        #[arg(long, env = "GIGASTT_BODY_LIMIT_BYTES", default_value_t = 256 * 1024 * 1024)]
         body_limit_bytes: usize,
+
+        /// Maximum accepted audio duration (seconds). Default 3900 (65 min).
+        /// Enforced during decode, so an oversized upload is aborted before its
+        /// PCM is fully realized.
+        #[arg(
+            long,
+            env = "GIGASTT_MAX_AUDIO_DURATION_S",
+            default_value_t = gigastt::inference::audio::DEFAULT_MAX_DURATION_S
+        )]
+        max_audio_duration_s: f64,
+
+        /// Wall-clock budget for a single transcription (seconds). `0` disables
+        /// the cap. Checked at chunk boundaries, so the session triplet is
+        /// always returned to the pool rather than leaked.
+        #[arg(long, env = "GIGASTT_MAX_INFERENCE_SECS", default_value_t = 1800)]
+        max_inference_secs: u64,
+
+        /// Maximum concurrent `/v1/transcribe*` requests. `0` derives it from
+        /// the pool size (2x). Bounds peak memory: axum buffers each upload
+        /// body whole before the handler runs.
+        #[arg(long, env = "GIGASTT_MAX_CONCURRENT_UPLOADS", default_value_t = 0)]
+        max_concurrent_uploads: usize,
 
         /// Per-IP rate limit — requests per minute. 0 = off (default).
         #[arg(long, env = "GIGASTT_RATE_LIMIT_PER_MINUTE", default_value_t = 0)]
@@ -104,8 +129,14 @@ enum Commands {
         shutdown_drain_secs: u64,
 
         /// Pool checkout timeout (seconds). REST and WebSocket handlers wait
-        /// this long for a free session triplet before returning 503.
-        #[arg(long, env = "GIGASTT_POOL_CHECKOUT_TIMEOUT_SECS", default_value_t = 30)]
+        /// this long for a free session triplet before returning 503. Default
+        /// 300: with long files occupying the pool for tens of minutes, a
+        /// 30-second window rejected callers whenever the server was merely busy.
+        #[arg(
+            long,
+            env = "GIGASTT_POOL_CHECKOUT_TIMEOUT_SECS",
+            default_value_t = 300
+        )]
         pool_checkout_timeout_secs: u64,
 
         /// Skip the automatic INT8 quantization step after download.
@@ -291,10 +322,17 @@ async fn main() -> anyhow::Result<()> {
             max_session_secs,
             shutdown_drain_secs,
             pool_checkout_timeout_secs,
+            max_audio_duration_s,
+            max_inference_secs,
+            max_concurrent_uploads,
             skip_quantize,
             trust_proxy,
         } => {
             ensure_bind_allowed(&host, bind_all)?;
+            // Install the process-wide cap before the engine loads so the
+            // library entry points that do not carry `RuntimeLimits` (the CLI
+            // `transcribe` path, FFI) agree with the server.
+            inference::audio::set_max_audio_duration_s(max_audio_duration_s);
             model::ensure_model(&model_dir).await?;
             #[cfg(feature = "diarization")]
             {
@@ -323,6 +361,9 @@ async fn main() -> anyhow::Result<()> {
                     max_session_secs,
                     shutdown_drain_secs,
                     pool_checkout_timeout_secs,
+                    max_audio_duration_s: inference::audio::max_audio_duration_s(),
+                    max_inference_secs,
+                    max_concurrent_uploads,
                 },
                 metrics_enabled: metrics,
                 trust_proxy,

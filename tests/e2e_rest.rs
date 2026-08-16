@@ -152,9 +152,139 @@ async fn test_transcribe_invalid_audio_returns_422() {
     let text = resp.text().await.expect("Expected text body");
     let body: serde_json::Value = serde_json::from_str(&text).expect("Expected JSON body");
     let code = body["code"].as_str().unwrap_or_default();
+    assert_eq!(
+        code, "invalid_audio",
+        "undecodable bytes must be reported as invalid_audio, got: {code:?}"
+    );
+
+    let _ = shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 4b. Long-audio support (60-minute call workload)
+// ---------------------------------------------------------------------------
+
+/// A file past the chunked-transcription threshold must transcribe end to end,
+/// and its word timestamps must stay inside the reported duration.
+///
+/// The timestamp bound is the regression guard for the chunked-offset drift:
+/// the old code advanced `frame_offset` by an estimate that ran 40 ms short per
+/// 20 s chunk, so a 12-minute file drifted ~1.4 s and the last word landed
+/// beyond `duration`.
+#[tokio::test]
+#[ignore]
+async fn test_transcribe_long_audio_returns_full_transcript() {
+    let (port, shutdown) = common::start_server(&common::model_dir()).await;
+
+    let duration_s = 12 * 60;
+    let wav = common::generate_wav(duration_s, 16000);
+
+    let resp = tokio::time::timeout(Duration::from_secs(1800), async {
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/transcribe"))
+            .body(wav)
+            .send()
+            .await
+            .expect("POST /v1/transcribe failed")
+    })
+    .await
+    .expect("POST /v1/transcribe timed out");
+
+    assert_eq!(resp.status(), 200, "12-minute audio must be accepted");
+    let text = resp.text().await.expect("Expected text body");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("Expected JSON body");
+
+    let reported = body["duration"].as_f64().expect("duration field");
     assert!(
-        code == "invalid_audio" || code == "transcription_error",
-        "code should be \"invalid_audio\" or \"transcription_error\", got: {code:?}"
+        (reported - duration_s as f64).abs() < 1.0,
+        "reported duration {reported}s should match the {duration_s}s input"
+    );
+
+    let words = body["words"].as_array().expect("words field");
+    let mut prev_start = f64::NEG_INFINITY;
+    for w in words {
+        let start = w["start"].as_f64().expect("word start");
+        assert!(
+            start >= prev_start,
+            "word starts must be non-decreasing: {start} after {prev_start}"
+        );
+        prev_start = start;
+    }
+    if let Some(last) = words.last() {
+        let end = last["end"].as_f64().expect("word end");
+        assert!(
+            end <= reported + 0.5,
+            "last word ends at {end}s, past the {reported}s file — timestamp drift regressed"
+        );
+    }
+
+    let _ = shutdown.send(());
+}
+
+/// Audio past the configured cap must say so, distinctly from "cannot decode".
+#[tokio::test]
+#[ignore]
+async fn test_transcribe_over_limit_returns_audio_too_long() {
+    let (port, shutdown) = common::start_server_with_limits(
+        &common::model_dir(),
+        gigastt::server::RuntimeLimits {
+            max_audio_duration_s: 5.0,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let wav = common::generate_wav(10, 16000);
+
+    let resp = tokio::time::timeout(Duration::from_secs(60), async {
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/transcribe"))
+            .body(wav)
+            .send()
+            .await
+            .expect("POST /v1/transcribe failed")
+    })
+    .await
+    .expect("POST /v1/transcribe timed out");
+
+    assert_eq!(resp.status(), 422);
+    let text = resp.text().await.expect("Expected text body");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("Expected JSON body");
+    assert_eq!(
+        body["code"].as_str().unwrap_or_default(),
+        "audio_too_long",
+        "over-length audio must not be reported as a format problem: {body}"
+    );
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains('5'),
+        "message should state the configured limit: {msg}"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// `GET /v1/models` advertises the limits so clients can pre-check locally.
+#[tokio::test]
+#[ignore]
+async fn test_models_advertises_limits() {
+    let (port, shutdown) = common::start_server(&common::model_dir()).await;
+
+    let text = reqwest::get(format!("http://127.0.0.1:{port}/v1/models"))
+        .await
+        .expect("GET /v1/models failed")
+        .text()
+        .await
+        .expect("Expected text body");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("Expected JSON body");
+
+    assert!(
+        body["max_audio_duration_s"].as_f64().unwrap_or(0.0) >= 3600.0,
+        "server should advertise at least an hour: {body}"
+    );
+    assert!(
+        body["max_body_bytes"].as_u64().unwrap_or(0) > 0,
+        "server should advertise its body limit: {body}"
     );
 
     let _ = shutdown.send(());

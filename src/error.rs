@@ -103,11 +103,29 @@ pub enum GigasttError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// Invalid audio input (unsupported format, excessive duration, corrupt data).
+    /// Invalid audio input (unsupported format, corrupt data).
     #[error("invalid audio: {reason}")]
     InvalidAudio {
         /// Human-readable description of why the audio was rejected.
         reason: String,
+    },
+    /// Audio decoded correctly but is longer than the configured cap.
+    ///
+    /// Split out from [`GigasttError::InvalidAudio`] so callers can tell "your
+    /// file is fine but too long" from "I could not read this file" — the two
+    /// need different remedies and different HTTP semantics.
+    #[error("audio too long: {observed_s:.0}s exceeds the {limit_s:.0}s limit")]
+    AudioTooLong {
+        /// Observed duration of the input, in seconds.
+        observed_s: f64,
+        /// The configured cap that was exceeded, in seconds.
+        limit_s: f64,
+    },
+    /// Transcription exceeded the configured wall-clock budget.
+    #[error("transcription timed out after {elapsed_s:.0}s")]
+    Timeout {
+        /// Wall-clock seconds spent before the deadline fired.
+        elapsed_s: f64,
     },
     /// Filesystem or I/O error.
     #[error(transparent)]
@@ -144,10 +162,7 @@ mod tests {
     fn test_display_model_load() {
         let e = GigasttError::ModelLoad {
             path: "encoder.onnx".into(),
-            source: Some(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "missing weights",
-            ))),
+            source: Some(Box::new(std::io::Error::other("missing weights"))),
         };
         assert!(e.to_string().contains("encoder.onnx"));
     }
@@ -155,10 +170,7 @@ mod tests {
     #[test]
     fn test_display_inference() {
         let e = GigasttError::Inference {
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "decoder failed",
-            )),
+            source: Box::new(std::io::Error::other("decoder failed")),
         };
         assert_eq!(e.to_string(), "inference failed");
     }
@@ -195,7 +207,7 @@ mod tests {
         // Verify GigasttError works with ? in anyhow::Result contexts
         fn returns_anyhow() -> anyhow::Result<()> {
             Err(GigasttError::Inference {
-                source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "test")),
+                source: Box::new(std::io::Error::other("test")),
             })?;
             Ok(())
         }

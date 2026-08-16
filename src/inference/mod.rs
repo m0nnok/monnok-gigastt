@@ -992,11 +992,8 @@ impl Engine {
         path: &str,
         triplet: &mut SessionTriplet,
     ) -> Result<TranscribeResult, GigasttError> {
-        let float_samples =
-            audio::decode_audio_file(path).map_err(|e| GigasttError::InvalidAudio {
-                reason: format!("{e:#}"),
-            })?;
-        self.transcribe_samples(&float_samples, triplet)
+        let float_samples = audio::decode_audio_file(path).map_err(classify_decode_error)?;
+        self.transcribe_samples(&float_samples, triplet, None)
     }
 
     /// Transcribe audio from raw bytes in memory (no temp file needed).
@@ -1025,11 +1022,35 @@ impl Engine {
         data: bytes::Bytes,
         triplet: &mut SessionTriplet,
     ) -> Result<TranscribeResult, GigasttError> {
-        let float_samples =
-            audio::decode_audio_bytes_shared(data).map_err(|e| GigasttError::InvalidAudio {
-                reason: format!("{e:#}"),
-            })?;
-        self.transcribe_samples(&float_samples, triplet)
+        self.transcribe_bytes_shared_with_limits(data, triplet, audio::max_audio_duration_s(), None)
+    }
+
+    /// [`Engine::transcribe_bytes_shared`] with an explicit duration cap and
+    /// wall-clock deadline.
+    ///
+    /// The server passes its configured `RuntimeLimits` here rather than
+    /// relying on process-wide state. `deadline` is checked cooperatively at
+    /// chunk boundaries, which matters because the caller runs this inside
+    /// `spawn_blocking`: a `tokio::time::timeout` around the join handle would
+    /// return early while the thread kept running and never released its pool
+    /// slot.
+    ///
+    /// # Errors
+    ///
+    /// [`GigasttError::AudioTooLong`] past `max_duration_s`,
+    /// [`GigasttError::InvalidAudio`] if the bytes cannot be decoded,
+    /// [`GigasttError::Timeout`] past `deadline`, or
+    /// [`GigasttError::Inference`] if the ONNX runtime fails.
+    pub fn transcribe_bytes_shared_with_limits(
+        &self,
+        data: bytes::Bytes,
+        triplet: &mut SessionTriplet,
+        max_duration_s: f64,
+        deadline: Option<Deadline>,
+    ) -> Result<TranscribeResult, GigasttError> {
+        let float_samples = audio::decode_audio_bytes_shared_with_limit(data, max_duration_s)
+            .map_err(classify_decode_error)?;
+        self.transcribe_samples(&float_samples, triplet, deadline)
     }
 
     /// Run the full mel + encoder + RNN-T decode pipeline on an already-decoded
@@ -1039,6 +1060,7 @@ impl Engine {
         &self,
         float_samples: &[f32],
         triplet: &mut SessionTriplet,
+        deadline: Option<Deadline>,
     ) -> Result<TranscribeResult, GigasttError> {
         let duration_s = float_samples.len() as f64 / 16000.0;
         let estimated_frames = estimate_mel_frames(float_samples.len());
@@ -1048,7 +1070,7 @@ impl Engine {
                 threshold = OFFLINE_FULL_ENCODER_MAX_FRAMES,
                 "Long audio detected, using chunked offline transcription"
             );
-            return self.transcribe_samples_chunked(float_samples, duration_s, triplet);
+            return self.transcribe_samples_chunked(float_samples, duration_s, triplet, deadline);
         }
 
         let (features, num_frames) = self.features.compute(float_samples);
@@ -1061,7 +1083,7 @@ impl Engine {
             .map_err(|e| GigasttError::Inference { source: e.into() })?;
 
         #[cfg(feature = "diarization")]
-        self.apply_offline_diarization(float_samples, &mut words);
+        self.apply_offline_diarization(float_samples, &mut words, deadline);
 
         let text: String = words
             .iter()
@@ -1081,12 +1103,20 @@ impl Engine {
         float_samples: &[f32],
         duration_s: f64,
         triplet: &mut SessionTriplet,
+        deadline: Option<Deadline>,
     ) -> Result<TranscribeResult, GigasttError> {
         let mut decoder_state = DecoderState::new(self.tokenizer.blank_id());
-        let mut frame_offset = 0usize;
+        let mut cumulative_samples = 0usize;
         let mut words = Vec::new();
 
         for chunk in float_samples.chunks(OFFLINE_CHUNK_SAMPLES) {
+            // Cooperative cancellation. Returning here (rather than being
+            // killed from outside) is what lets the caller check the session
+            // triplet back into the pool instead of leaking it.
+            if let Some(d) = deadline {
+                d.check()?;
+            }
+            let frame_offset = offline_frame_offset(cumulative_samples);
             let (features, num_frames) = self.features.compute(chunk);
             tracing::info!(
                 chunk_samples = chunk.len(),
@@ -1106,11 +1136,11 @@ impl Engine {
                 .map_err(|e| GigasttError::Inference { source: e.into() })?;
 
             words.append(&mut chunk_words);
-            frame_offset += encoder_frame_offset_for_samples(chunk.len());
+            cumulative_samples += chunk.len();
         }
 
         #[cfg(feature = "diarization")]
-        self.apply_offline_diarization(float_samples, &mut words);
+        self.apply_offline_diarization(float_samples, &mut words, deadline);
 
         let text = words
             .iter()
@@ -1126,15 +1156,57 @@ impl Engine {
     }
 
     #[cfg(feature = "diarization")]
-    fn apply_offline_diarization(&self, float_samples: &[f32], words: &mut [WordInfo]) {
+    fn apply_offline_diarization(
+        &self,
+        float_samples: &[f32],
+        words: &mut [WordInfo],
+        deadline: Option<Deadline>,
+    ) {
         let Some(ref enc) = self.speaker_encoder else {
             return;
         };
+
+        // `OfflineDiarizer::run` is a single opaque call over the whole buffer,
+        // so it cannot be interrupted once started — the best we can do is
+        // decline to start it when the budget is already spent. Transcription
+        // is the deliverable; speaker labels are an enrichment, so a blown
+        // deadline degrades to an unlabelled transcript rather than a 504.
+        if let Some(d) = deadline
+            && d.check().is_err()
+        {
+            tracing::warn!(
+                elapsed_s = d.elapsed().as_secs_f64(),
+                "Skipping diarization: inference budget already spent"
+            );
+            return;
+        }
+
+        // Diarization is the one remaining step that runs over the whole
+        // buffer at once, and it lives in an external crate whose clustering
+        // cost we cannot read. Log enough to characterise how it scales with
+        // audio length before deciding whether it needs windowing: compare
+        // `rtf` across a 1/5/15/30/60-minute sweep — roughly flat means
+        // embedding extraction dominates (linear), sharply rising means the
+        // clustering does.
+        let audio_s = float_samples.len() as f64 / 16000.0;
+        let rss_before_kb = read_rss_kb();
+        let started = std::time::Instant::now();
 
         let config = DiaConfig::default();
         let diarizer = OfflineDiarizer::new(config);
         match diarizer.run(float_samples, enc) {
             Ok(dia_result) => {
+                let elapsed = started.elapsed();
+                tracing::info!(
+                    audio_s,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    rtf = elapsed.as_secs_f64() / audio_s.max(f64::EPSILON),
+                    turns = dia_result.turns.len(),
+                    segments = dia_result.segments.len(),
+                    num_speakers = dia_result.num_speakers,
+                    rss_delta_mb = rss_delta_mb(rss_before_kb),
+                    "offline_diarization"
+                );
                 for word in words {
                     let mid = (word.start + word.end) / 2.0;
                     if let Some(turn) = dia_result
@@ -1147,7 +1219,11 @@ impl Engine {
                 }
             }
             Err(e) => {
-                tracing::warn!("Offline diarization failed: {e:#}");
+                tracing::warn!(
+                    audio_s,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Offline diarization failed: {e:#}"
+                );
             }
         }
     }
@@ -1298,8 +1374,109 @@ fn estimate_mel_frames(sample_count: usize) -> usize {
     }
 }
 
-fn encoder_frame_offset_for_samples(sample_count: usize) -> usize {
-    estimate_mel_frames(sample_count) / ENCODER_SUBSAMPLING
+/// Map a decode failure onto the typed error surface.
+///
+/// Duration overruns are classified by downcasting to [`audio::AudioTooLong`]
+/// rather than by inspecting the message, so rewording a context string cannot
+/// silently reclassify the error. Everything else keeps the full `anyhow` chain
+/// in `reason` for operators — callers that cross a trust boundary are expected
+/// to render their own message rather than echo it.
+/// Resident set size in KiB, on platforms that expose it cheaply.
+///
+/// Linux-only: `/proc/self/statm` reports RSS in pages and is a single small
+/// read, so it is safe to sample around a long-running step. Elsewhere the
+/// measurement is simply absent rather than approximated.
+#[cfg(feature = "diarization")]
+fn read_rss_kb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(rss_pages * 4) // 4 KiB pages
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// RSS growth in MiB since `before_kb`, or `-1.0` when unavailable.
+#[cfg(feature = "diarization")]
+fn rss_delta_mb(before_kb: Option<u64>) -> f64 {
+    match (before_kb, read_rss_kb()) {
+        (Some(before), Some(after)) => (after as f64 - before as f64) / 1024.0,
+        _ => -1.0,
+    }
+}
+
+/// Cooperative wall-clock budget for a single transcription.
+///
+/// Offline transcription runs on a blocking thread, and `spawn_blocking` tasks
+/// cannot be cancelled from the outside — wrapping the join handle in a timeout
+/// would hand the client an error while the thread carried on holding its pool
+/// slot. So the budget is carried inward and checked at chunk boundaries, where
+/// returning early releases everything cleanly.
+#[derive(Debug, Clone, Copy)]
+pub struct Deadline {
+    started: std::time::Instant,
+    limit: std::time::Duration,
+}
+
+impl Deadline {
+    /// A budget of `limit` starting now. `None` when `limit` is zero, which is
+    /// the documented way to disable the cap.
+    pub fn after(limit: std::time::Duration) -> Option<Self> {
+        if limit.is_zero() {
+            return None;
+        }
+        Some(Self {
+            started: std::time::Instant::now(),
+            limit,
+        })
+    }
+
+    /// Wall-clock time since the budget started.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// `Err(GigasttError::Timeout)` once the budget is spent.
+    pub fn check(&self) -> Result<(), GigasttError> {
+        let elapsed = self.elapsed();
+        if elapsed > self.limit {
+            return Err(GigasttError::Timeout {
+                elapsed_s: elapsed.as_secs_f64(),
+            });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn classify_decode_error(e: anyhow::Error) -> GigasttError {
+    match e.downcast_ref::<audio::AudioTooLong>() {
+        Some(too_long) => GigasttError::AudioTooLong {
+            observed_s: too_long.observed_s,
+            limit_s: too_long.limit_s,
+        },
+        None => GigasttError::InvalidAudio {
+            reason: format!("{e:#}"),
+        },
+    }
+}
+
+/// Absolute encoder-frame index of sample `sample_index` in the 16 kHz stream.
+///
+/// One encoder frame spans `HOP_LENGTH * ENCODER_SUBSAMPLING` = 640 samples =
+/// 40 ms, which is exactly what [`SECONDS_PER_FRAME`] converts back to.
+///
+/// Anchoring to the absolute sample position matters for long files. The
+/// previous implementation accumulated a per-chunk estimate derived from
+/// `estimate_mel_frames` (the `center=false` formula `(n - N_FFT)/HOP + 1`),
+/// which is one mel frame short of elapsed time for a full chunk. Summed over
+/// a 60-minute file that lost 40 ms per 20 s chunk — about 7 s of drift by the
+/// end, which misaligns word timestamps against diarization turns.
+fn offline_frame_offset(sample_index: usize) -> usize {
+    sample_index / (HOP_LENGTH * ENCODER_SUBSAMPLING)
 }
 
 fn ort_intra_threads_from_env() -> usize {
@@ -1387,12 +1564,36 @@ mod tests {
     }
 
     #[test]
-    fn test_encoder_frame_offset_uses_subsampled_mel_frames() {
-        let sample_count = 16000;
+    fn test_offline_frame_offset_is_absolute_sample_position() {
+        // One encoder frame covers HOP_LENGTH * ENCODER_SUBSAMPLING = 640 samples.
+        assert_eq!(offline_frame_offset(0), 0);
+        assert_eq!(offline_frame_offset(OFFLINE_CHUNK_SAMPLES), 500);
+        assert_eq!(offline_frame_offset(3 * OFFLINE_CHUNK_SAMPLES), 1500);
+    }
+
+    #[test]
+    fn test_offline_chunk_samples_align_to_encoder_frames() {
+        // The offset is only exact for every chunk if the chunk length is a
+        // whole number of encoder frames.
         assert_eq!(
-            encoder_frame_offset_for_samples(sample_count),
-            estimate_mel_frames(sample_count) / ENCODER_SUBSAMPLING
+            OFFLINE_CHUNK_SAMPLES % (HOP_LENGTH * ENCODER_SUBSAMPLING),
+            0
         );
+    }
+
+    #[test]
+    fn test_offline_frame_offset_matches_elapsed_seconds() {
+        // The offset feeds `frame * SECONDS_PER_FRAME`, so it must round-trip
+        // to wall-clock position in the 16 kHz stream.
+        for chunk_index in 0..180 {
+            let samples = chunk_index * OFFLINE_CHUNK_SAMPLES;
+            let elapsed_s = samples as f64 / 16000.0;
+            let offset_s = offline_frame_offset(samples) as f64 * SECONDS_PER_FRAME;
+            assert!(
+                (offset_s - elapsed_s).abs() < 1e-9,
+                "chunk {chunk_index}: offset {offset_s}s vs elapsed {elapsed_s}s"
+            );
+        }
     }
 
     #[test]

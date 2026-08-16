@@ -136,7 +136,12 @@ pub struct RuntimeLimits {
     pub idle_timeout_secs: u64,
     /// Maximum WebSocket frame / message size in bytes. Default: 512 KiB.
     pub ws_frame_max_bytes: usize,
-    /// Maximum REST request body in bytes. Default: 50 MiB.
+    /// Maximum REST request body in bytes. Default: 256 MiB.
+    ///
+    /// Sized for hour-long uploads: 60 min of MP3/AAC at 320 kbps is ~137 MiB
+    /// and 60 min of 16 kHz mono WAV is ~110 MiB. Uncompressed 48 kHz stereo
+    /// (~659 MiB for an hour) is deliberately *not* covered — clients should
+    /// downmix or compress rather than have the server hold that per request.
     pub body_limit_bytes: usize,
     /// Per-IP rate limit: requests-per-minute. `0` disables the limiter
     /// (default). Applies to /v1/* and /v1/ws; /health is exempt.
@@ -153,8 +158,28 @@ pub struct RuntimeLimits {
     pub shutdown_drain_secs: u64,
     /// Pool checkout timeout (seconds). REST and WebSocket handlers wait this
     /// long for a free session triplet before returning 503 / `timeout`.
-    /// The `Retry-After` hint echoes the same value. Default: 30.
+    /// The `Retry-After` hint echoes the same value. Default: 300.
+    ///
+    /// Sized for the long-file workload: with a 4-slot pool and jobs running
+    /// tens of minutes, a 30 s window returned 503 whenever the server was
+    /// merely busy. Five minutes covers the tail of a job that started shortly
+    /// before this one; past that, 503 + `Retry-After` is the honest answer.
     pub pool_checkout_timeout_secs: u64,
+    /// Longest audio file accepted, in seconds. Enforced incrementally during
+    /// decode so an oversized upload aborts before its PCM is realized.
+    /// Default: [`crate::inference::audio::DEFAULT_MAX_DURATION_S`] (65 min).
+    pub max_audio_duration_s: f64,
+    /// Wall-clock budget for a single transcription, in seconds. `0` disables
+    /// the cap. Checked cooperatively at chunk boundaries so the session
+    /// triplet is always returned to the pool. Default: 1800 (30 min).
+    pub max_inference_secs: u64,
+    /// Maximum number of `/v1/transcribe*` requests admitted concurrently.
+    /// `0` derives it from the pool size.
+    ///
+    /// This bounds memory, not throughput: axum buffers the whole upload body
+    /// before a handler runs, so without admission control N simultaneous
+    /// uploads each hold up to `body_limit_bytes` while queued for the pool.
+    pub max_concurrent_uploads: usize,
 }
 
 impl Default for RuntimeLimits {
@@ -162,12 +187,15 @@ impl Default for RuntimeLimits {
         Self {
             idle_timeout_secs: 300,
             ws_frame_max_bytes: 512 * 1024,
-            body_limit_bytes: 50 * 1024 * 1024,
+            body_limit_bytes: 256 * 1024 * 1024,
             rate_limit_per_minute: 0,
             rate_limit_burst: 10,
             max_session_secs: 3600,
             shutdown_drain_secs: 10,
-            pool_checkout_timeout_secs: 30,
+            pool_checkout_timeout_secs: 300,
+            max_audio_duration_s: crate::inference::audio::DEFAULT_MAX_DURATION_S,
+            max_inference_secs: 1800,
+            max_concurrent_uploads: 0,
         }
     }
 }
@@ -267,6 +295,18 @@ pub async fn run_with_config_listener(
         tracing::warn!("pool_checkout_timeout_secs=0 would make the pool unusable; clamping to 1");
         config.limits.pool_checkout_timeout_secs = 1;
     }
+    if !(config.limits.max_audio_duration_s.is_finite() && config.limits.max_audio_duration_s > 0.0)
+    {
+        tracing::warn!(
+            "max_audio_duration_s must be a positive number; falling back to {}",
+            crate::inference::audio::DEFAULT_MAX_DURATION_S
+        );
+        config.limits.max_audio_duration_s = crate::inference::audio::DEFAULT_MAX_DURATION_S;
+    }
+    config.limits.max_audio_duration_s = config
+        .limits
+        .max_audio_duration_s
+        .min(crate::inference::audio::ABSOLUTE_MAX_DURATION_S);
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .context("Invalid host:port")?;
@@ -308,6 +348,15 @@ pub async fn run_with_config_listener(
             "gigastt_inference_duration_seconds",
             "Inference duration in seconds",
             self::metrics::DEFAULT_BUCKETS,
+        );
+        reg.register_histogram(
+            "gigastt_audio_duration_seconds",
+            "Duration of the submitted audio in seconds",
+            self::metrics::DEFAULT_BUCKETS,
+        );
+        reg.register_counter(
+            "gigastt_upload_admission_rejections_total",
+            "Uploads rejected because the concurrency limit was saturated",
         );
         reg.register_counter(
             "gigastt_rate_limit_rejections_total",
@@ -359,10 +408,41 @@ pub async fn run_with_config_listener(
         })
     };
 
-    // Protected sub-router: /v1/*, /ws alias, and /metrics — all subject to
-    // the origin allowlist and (when enabled) the per-IP rate limiter.
-    let protected = Router::new()
-        .route("/v1/models", get(http::models))
+    // Admission control for the upload endpoints.
+    //
+    // The pool bounds how many transcriptions run at once, but *not* how many
+    // uploads are resident: axum collects the whole request body before the
+    // handler's `Bytes` extractor yields, so without this every queued request
+    // holds up to `body_limit_bytes` while it waits for a triplet. At a 256 MiB
+    // limit that turns a slow endpoint into an easy OOM, which is why raising
+    // the body limit and adding this landed together.
+    let upload_permits = if config.limits.max_concurrent_uploads > 0 {
+        config.limits.max_concurrent_uploads
+    } else {
+        // Two per pool slot: one transcribing, one staged behind it.
+        (state.engine.pool.total() * 2).max(1)
+    };
+    tracing::info!(
+        upload_permits,
+        body_limit_bytes = config.limits.body_limit_bytes,
+        max_audio_duration_s = config.limits.max_audio_duration_s,
+        max_inference_secs = config.limits.max_inference_secs,
+        "upload admission control enabled"
+    );
+    let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(upload_permits));
+    let admission_layer = {
+        let semaphore = upload_semaphore.clone();
+        let limits = config.limits.clone();
+        let registry = metrics_registry.clone();
+        axum::middleware::from_fn(move |req, next| {
+            let semaphore = semaphore.clone();
+            let limits = limits.clone();
+            let registry = registry.clone();
+            async move { upload_admission_middleware(semaphore, limits, registry, req, next).await }
+        })
+    };
+
+    let upload_routes = Router::new()
         .route("/v1/transcribe", post(http::transcribe))
         .route(
             "/v1/transcribe",
@@ -373,6 +453,14 @@ pub async fn run_with_config_listener(
             "/v1/transcribe/stream",
             options(|| async { StatusCode::NO_CONTENT }),
         )
+        .layer(admission_layer)
+        .with_state(state.clone());
+
+    // Protected sub-router: /v1/*, /ws alias, and /metrics — all subject to
+    // the origin allowlist and (when enabled) the per-IP rate limiter.
+    let protected = Router::new()
+        .route("/v1/models", get(http::models))
+        .merge(upload_routes)
         // `/v1/ws` is the canonical path (versioned, aligned with REST); `/ws`
         // remains as an alias for existing clients and logs a deprecation
         // warning on each upgrade. Planned for removal in a future major version.
@@ -570,6 +658,45 @@ async fn http_metrics_middleware(
         elapsed,
     );
     response
+}
+
+/// Bound how many upload requests are resident at once.
+///
+/// The permit is held for the whole request, so it covers body collection *and*
+/// inference. Waiting reuses `pool_checkout_timeout_secs` and the same 503 +
+/// `Retry-After` shape the pool itself returns, so a client sees one consistent
+/// backpressure contract regardless of which queue it landed in.
+///
+/// Preflight `OPTIONS` is exempt: it does no work and must stay answerable while
+/// the server is saturated.
+async fn upload_admission_middleware(
+    semaphore: Arc<tokio::sync::Semaphore>,
+    limits: RuntimeLimits,
+    metrics: Option<Arc<self::metrics::MetricsRegistry>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if req.method() == axum::http::Method::OPTIONS {
+        return next.run(req).await;
+    }
+
+    let wait = std::time::Duration::from_secs(limits.pool_checkout_timeout_secs);
+    // `acquire_owned` consumes the handle; keep one for the rejection log.
+    match tokio::time::timeout(wait, semaphore.clone().acquire_owned()).await {
+        // Bind the permit so it lives for the duration of the request.
+        Ok(Ok(_permit)) => next.run(req).await,
+        Ok(Err(_closed)) => http::api_pool_closed_error(),
+        Err(_timeout) => {
+            tracing::warn!(
+                available = semaphore.available_permits(),
+                "upload admission timed out; rejecting with 503"
+            );
+            if let Some(reg) = metrics {
+                reg.counter_inc("gigastt_upload_admission_rejections_total", vec![], 1);
+            }
+            http::api_timeout_error(&limits)
+        }
+    }
 }
 
 async fn origin_middleware(

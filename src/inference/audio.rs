@@ -13,7 +13,84 @@ use symphonia::core::probe::Hint;
 use super::{HOP_LENGTH, N_FFT};
 
 const MAX_BUFFER_SAMPLES: usize = 16000 * 5; // 5 seconds at 16kHz
-const MAX_DURATION_S: f64 = 600.0; // 10 minutes
+
+/// Default maximum accepted audio duration, in seconds (65 minutes).
+///
+/// Slightly above a round hour so a nominally "60 minute" recording carrying a
+/// few seconds of leader or trailer is not rejected on a rounding technicality.
+pub const DEFAULT_MAX_DURATION_S: f64 = 3900.0;
+
+/// Hard ceiling on the configured cap. Guards against a typo in the env var or
+/// CLI flag turning the incremental duration check into a no-op.
+pub const ABSOLUTE_MAX_DURATION_S: f64 = 6.0 * 3600.0;
+
+/// Process-wide duration cap, installed once at startup by
+/// [`set_max_audio_duration_s`].
+static MAX_DURATION_OVERRIDE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// Install the process-wide audio duration cap. Later calls are ignored.
+///
+/// Called once from `main` before the engine loads. A `OnceLock` rather than
+/// `std::env::set_var` because the latter is `unsafe` in Rust 2024 and racy
+/// against the thread pool; tests take the explicit `*_with_limit` entry points
+/// instead of mutating global state.
+pub fn set_max_audio_duration_s(secs: f64) {
+    let clamped = if secs.is_finite() && secs > 0.0 {
+        secs.min(ABSOLUTE_MAX_DURATION_S)
+    } else {
+        DEFAULT_MAX_DURATION_S
+    };
+    let _ = MAX_DURATION_OVERRIDE.set(clamped);
+}
+
+/// Effective duration cap: the value installed by [`set_max_audio_duration_s`],
+/// else `GIGASTT_MAX_AUDIO_DURATION_S`, else [`DEFAULT_MAX_DURATION_S`].
+pub fn max_audio_duration_s() -> f64 {
+    match MAX_DURATION_OVERRIDE.get() {
+        Some(&secs) => secs,
+        None => parse_max_duration_s(
+            std::env::var("GIGASTT_MAX_AUDIO_DURATION_S")
+                .ok()
+                .as_deref(),
+        ),
+    }
+}
+
+/// Pure, env-free parser — the unit-testable half, mirroring the
+/// `parse_env_flag` / `parse_ort_intra_threads` pattern in `inference::mod`.
+fn parse_max_duration_s(value: Option<&str>) -> f64 {
+    match value.and_then(|v| v.trim().parse::<f64>().ok()) {
+        Some(secs) if secs.is_finite() && secs > 0.0 => secs.min(ABSOLUTE_MAX_DURATION_S),
+        _ => DEFAULT_MAX_DURATION_S,
+    }
+}
+
+/// Source-rate window handed to the resampler during decode.
+///
+/// The decode path used to accumulate the whole file at its source sample rate
+/// and then resample it in a single call, which built a `SincFixedIn` whose
+/// `chunk_size` was the entire file and allocated several full-length copies on
+/// the way (a 60-minute 48 kHz stereo upload peaked around 2.7 GB). Resampling
+/// in fixed windows instead keeps only the 16 kHz result in memory, so peak
+/// usage no longer depends on the source sample rate.
+///
+/// 32768 samples is ~0.68 s at 48 kHz — 128 KiB per buffer, small enough that
+/// the per-window allocations are noise next to the output vector.
+const RESAMPLE_WINDOW_SAMPLES: usize = 32_768;
+
+/// Audio decoded correctly but is longer than the configured cap.
+///
+/// A typed carrier rather than a bare `anyhow!` string so the HTTP layer can
+/// classify the failure by `downcast_ref` instead of matching on message text,
+/// which would silently break the moment a context string is reworded.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("Audio file too long ({observed_s:.0}s). Maximum supported: {limit_s:.0}s.")]
+pub struct AudioTooLong {
+    /// Observed duration of the upload, in seconds.
+    pub observed_s: f64,
+    /// The cap that was exceeded, in seconds.
+    pub limit_s: f64,
+}
 
 /// Sample rate in Hz. Invariant: `rate > 0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -110,7 +187,8 @@ impl MediaSource for BytesMediaSource {
 /// Decode any supported audio file to mono f32 samples at 16kHz.
 ///
 /// Supports WAV, MP3, M4A/AAC, OGG/Vorbis, and FLAC via symphonia.
-/// Multi-channel audio is mixed to mono. Files longer than 10 minutes are rejected.
+/// Multi-channel audio is mixed to mono. Files longer than
+/// [`max_audio_duration_s`] are rejected.
 ///
 /// # Errors
 ///
@@ -140,7 +218,7 @@ pub fn decode_audio_file(path: &str) -> Result<Vec<f32>> {
             .to_string_lossy()
     );
 
-    decode_audio_inner(mss, hint, &source_label)
+    decode_audio_inner(mss, hint, &source_label, max_audio_duration_s())
 }
 
 /// Decode audio from raw bytes in memory (no temp file needed).
@@ -164,7 +242,7 @@ pub fn decode_audio_bytes(data: &[u8]) -> Result<Vec<f32>> {
 ///
 /// Same logic as [`decode_audio_file`] but reads from a reference-counted
 /// in-memory buffer. Supports WAV, MP3, M4A/AAC, OGG/Vorbis, and FLAC via
-/// symphonia. Multi-channel audio is mixed to mono. The 10-minute duration
+/// symphonia. Multi-channel audio is mixed to mono. The [`max_audio_duration_s`]
 /// cap is enforced **incrementally** on each decoded packet: a malicious or
 /// malformed upload is aborted before its decoded samples blow up RAM.
 ///
@@ -177,14 +255,36 @@ pub fn decode_audio_bytes(data: &[u8]) -> Result<Vec<f32>> {
 /// fn decode_audio_bytes_shared(data: Bytes) -> Result<Vec<f32>>
 /// { ret.as_ref().map(|v| !v.is_empty()).unwrap_or(true) }
 pub fn decode_audio_bytes_shared(data: Bytes) -> Result<Vec<f32>> {
+    decode_audio_bytes_shared_with_limit(data, max_audio_duration_s())
+}
+
+/// [`decode_audio_bytes_shared`] with an explicit duration cap.
+///
+/// Lets a caller that already holds a configured limit (the server's
+/// `RuntimeLimits`, or a test) bypass the process-wide default instead of
+/// reaching for global state.
+///
+/// # Errors
+///
+/// Returns an error if the bytes cannot be decoded or the audio is longer than
+/// `max_duration_s`.
+pub fn decode_audio_bytes_shared_with_limit(data: Bytes, max_duration_s: f64) -> Result<Vec<f32>> {
     let source = BytesMediaSource::new(data);
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
     let hint = Hint::new();
-    decode_audio_inner(mss, hint, "bytes")
+    decode_audio_inner(mss, hint, "bytes", max_duration_s)
 }
 
 /// Shared decode logic: probe → format → decode → mono mix → duration check → resample.
-fn decode_audio_inner(mss: MediaSourceStream, hint: Hint, source_label: &str) -> Result<Vec<f32>> {
+///
+/// Resampling happens **incrementally**, in [`RESAMPLE_WINDOW_SAMPLES`] windows
+/// drained from the packet loop, so only the 16 kHz result is ever held whole.
+fn decode_audio_inner(
+    mss: MediaSourceStream,
+    hint: Hint,
+    source_label: &str,
+    max_duration_s: f64,
+) -> Result<Vec<f32>> {
     let probed = symphonia::default::get_probe()
         .format(
             &hint,
@@ -215,15 +315,36 @@ fn decode_audio_inner(mss: MediaSourceStream, hint: Hint, source_label: &str) ->
         .make(&track.codec_params, &DecoderOptions::default())
         .context("Unsupported audio codec")?;
 
-    let mut all_samples: Vec<f32> = match n_frames_hint {
-        Some(n) if n > 0 && n <= (MAX_DURATION_S as u64 + 1) * sample_rate as u64 => {
-            Vec::with_capacity(n as usize)
+    let needs_resample = sample_rate != 16000;
+
+    // Reserve for the *16 kHz output*, and clamp rather than discard. The old
+    // code threw the hint away entirely for any file longer than the cap, so a
+    // long WAV grew by doubling — with a transient `old + new` peak on the
+    // final realloc that dwarfed the buffer itself. Clamping still bounds a
+    // hostile or wrong `n_frames` header.
+    let cap_16k = (max_duration_s * 16000.0) as usize + 16000;
+    let mut out16k: Vec<f32> = match n_frames_hint {
+        Some(n) if n > 0 => {
+            let out_len = ((n as u128 * 16000) / sample_rate as u128) as usize;
+            Vec::with_capacity(out_len.min(cap_16k))
         }
         _ => Vec::new(),
     };
+
+    // Staging buffer for source-rate samples awaiting a full resample window.
+    // Unused (and unallocated) when the source is already 16 kHz.
+    let mut pending: Vec<f32> = if needs_resample {
+        Vec::with_capacity(RESAMPLE_WINDOW_SAMPLES * 2)
+    } else {
+        Vec::new()
+    };
+    let mut resampler: Option<rubato::SincFixedIn<f32>> = None;
+
     // Precompute the sample budget so the check is a single comparison per
-    // packet rather than a floating-point divide.
-    let max_samples: usize = (MAX_DURATION_S * sample_rate as f64) as usize;
+    // packet rather than a floating-point divide. Kept at the *source* rate:
+    // it is exact per packet and aborts as early as possible.
+    let mut src_total: u64 = 0;
+    let max_src_samples = (max_duration_s * sample_rate as f64) as u64;
 
     loop {
         let packet = match format.next_packet() {
@@ -248,7 +369,14 @@ fn decode_audio_inner(mss: MediaSourceStream, hint: Hint, source_label: &str) ->
         sample_buf.copy_interleaved_ref(decoded);
         let samples = sample_buf.samples();
 
-        // Mix to mono if multi-channel
+        // Mix to mono if multi-channel. When the source needs resampling the
+        // samples land in `pending` and are drained a window at a time below;
+        // at 16 kHz they go straight to the output.
+        let sink = if needs_resample {
+            &mut pending
+        } else {
+            &mut out16k
+        };
         if spec.channels.count() > 1 {
             let ch = spec.channels.count();
             for frame in 0..num_frames {
@@ -256,41 +384,83 @@ fn decode_audio_inner(mss: MediaSourceStream, hint: Hint, source_label: &str) ->
                 for c in 0..ch {
                     sum += samples[frame * ch + c];
                 }
-                all_samples.push(sum / ch as f32);
+                sink.push(sum / ch as f32);
             }
         } else {
-            all_samples.extend_from_slice(samples);
+            sink.extend_from_slice(samples);
         }
+        src_total += num_frames as u64;
 
         // Incremental duration cap: abort before the next packet is decoded
-        // if the accumulated buffer already exceeds the 10-minute budget.
-        // This prevents a crafted upload from allocating hundreds of MiB of
-        // PCM before the post-loop guard gets a chance to run.
-        if all_samples.len() > max_samples {
-            let observed_s = all_samples.len() as f64 / sample_rate as f64;
-            anyhow::bail!(
-                "Audio file too long ({:.0}s). Maximum supported: {MAX_DURATION_S:.0}s.",
-                observed_s
-            );
+        // if the accumulated audio already exceeds the budget. This prevents a
+        // crafted upload from allocating hundreds of MiB of PCM before the
+        // post-loop guard gets a chance to run.
+        if src_total > max_src_samples {
+            anyhow::bail!(AudioTooLong {
+                observed_s: src_total as f64 / sample_rate as f64,
+                limit_s: max_duration_s,
+            });
+        }
+
+        if needs_resample {
+            let full_windows = pending.len() / RESAMPLE_WINDOW_SAMPLES;
+            for i in 0..full_windows {
+                let window =
+                    &pending[i * RESAMPLE_WINDOW_SAMPLES..(i + 1) * RESAMPLE_WINDOW_SAMPLES];
+                let out = resample_with_cache(
+                    window,
+                    SampleRate(sample_rate),
+                    SampleRate(16000),
+                    &mut resampler,
+                )
+                .context("Resampling failed")?;
+                out16k.extend_from_slice(&out);
+            }
+            if full_windows > 0 {
+                let consumed = full_windows * RESAMPLE_WINDOW_SAMPLES;
+                pending.copy_within(consumed.., 0);
+                pending.truncate(pending.len() - consumed);
+            }
         }
     }
 
-    let duration_s = all_samples.len() as f64 / sample_rate as f64;
-    tracing::info!(
-        "Decoded {} samples at {}Hz ({:.1}s)",
-        all_samples.len(),
-        sample_rate,
-        duration_s
-    );
+    // Flush the tail. Zero-pad to a full window rather than shrinking the
+    // resampler: `SincFixedIn::process` carries its FIR history by copying
+    // `[chunk_size .. chunk_size + 2*sinc_len]` to the front of its buffer, so
+    // the carry is indexed by the *current* `chunk_size` and assumes it matches
+    // the previous call's. Calling `set_chunk_size` with a shorter tail makes
+    // that read the wrong history window and produces a real discontinuity at
+    // the very end of the file. Holding `chunk_size` constant and trimming the
+    // resampled padding afterwards costs one window of silence and nothing else.
+    if needs_resample && !pending.is_empty() {
+        pending.resize(RESAMPLE_WINDOW_SAMPLES, 0.0);
+        let out = resample_with_cache(
+            &pending,
+            SampleRate(sample_rate),
+            SampleRate(16000),
+            &mut resampler,
+        )
+        .context("Resampling failed")?;
+        out16k.extend_from_slice(&out);
 
-    // Resample to 16kHz if needed
-    if sample_rate != 16000 {
-        all_samples = resample(&all_samples, SampleRate(sample_rate), SampleRate(16000))
-            .context("Resampling failed")?;
-        tracing::info!("Resampled to 16kHz: {} samples", all_samples.len());
+        // Drop the resampled padding. `min` guards the case where the tail
+        // nearly filled a window: the resampler's group delay then leaves the
+        // output slightly *shorter* than the ideal length and there is nothing
+        // to trim.
+        let expected = (src_total * 16000 / sample_rate as u64) as usize;
+        out16k.truncate(expected.min(out16k.len()));
     }
 
-    Ok(all_samples)
+    let duration_s = src_total as f64 / sample_rate as f64;
+    tracing::info!(
+        "Decoded {} samples at {}Hz ({:.1}s) -> {} samples at 16kHz",
+        src_total,
+        sample_rate,
+        duration_s,
+        out16k.len()
+    );
+
+    Ok(out16k)
 }
 
 /// High-quality polyphase FIR resampler (rubato SincFixedIn).
@@ -667,6 +837,16 @@ mod tests {
     // --- decode_audio_bytes tests ---
 
     fn make_wav_bytes(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+        make_wav_bytes_channels(samples, sample_rate, 1)
+    }
+
+    /// Interleaved stereo WAV. `samples` holds L,R pairs.
+    fn make_wav_bytes_stereo(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+        make_wav_bytes_channels(samples, sample_rate, 2)
+    }
+
+    fn make_wav_bytes_channels(samples: &[i16], sample_rate: u32, channels: u16) -> Vec<u8> {
+        let block_align = channels * 2;
         let data_size = (samples.len() * 2) as u32;
         let file_size = 36 + data_size;
         let mut buf = Vec::new();
@@ -676,10 +856,10 @@ mod tests {
         buf.extend_from_slice(b"fmt ");
         buf.extend_from_slice(&16u32.to_le_bytes()); // chunk size
         buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        buf.extend_from_slice(&1u16.to_le_bytes()); // mono
+        buf.extend_from_slice(&channels.to_le_bytes());
         buf.extend_from_slice(&sample_rate.to_le_bytes());
-        buf.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
-        buf.extend_from_slice(&2u16.to_le_bytes()); // block align
+        buf.extend_from_slice(&(sample_rate * block_align as u32).to_le_bytes()); // byte rate
+        buf.extend_from_slice(&block_align.to_le_bytes());
         buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
         buf.extend_from_slice(b"data");
         buf.extend_from_slice(&data_size.to_le_bytes());
@@ -815,24 +995,177 @@ mod tests {
 
     #[test]
     fn test_decode_duration_cap_streaming() {
-        // 12 minutes of silence at 16kHz (> 10 min cap). The incremental
-        // check inside the decode loop must abort before the full PCM buffer
-        // is realized, so peak allocation stays bounded well under the
-        // in-memory size of the decoded result. We assert:
-        //   (a) an `InvalidAudio`-style error is returned,
-        //   (b) its message mentions "too long" (the error surface clients see).
-        // The allocation-budget assertion from the spec is satisfied by
-        // construction — early abort fires at ~10 min worth of samples, not
-        // 12 min — and is verified indirectly via the sample count.
-        let duration_s: usize = 12 * 60;
-        let silence: Vec<i16> = vec![0; duration_s * 16000];
+        // The incremental check inside the decode loop must abort before the
+        // full PCM buffer is realized. Driven through the explicit-limit entry
+        // point with a 5s cap and 10s of audio so the test neither depends on
+        // the process-wide default nor allocates minutes of silence.
+        let silence: Vec<i16> = vec![0; 10 * 16000];
         let wav = make_wav_bytes(&silence, 16000);
-        let result = decode_audio_bytes_shared(Bytes::from(wav));
-        let err = result.expect_err("12-minute audio must be rejected");
+        let result = decode_audio_bytes_shared_with_limit(Bytes::from(wav), 5.0);
+        let err = result.expect_err("audio over the cap must be rejected");
         let msg = format!("{err:#}");
         assert!(
             msg.to_lowercase().contains("too long"),
             "error should mention 'too long', got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_decode_respects_custom_duration_limit() {
+        let silence: Vec<i16> = vec![0; 3 * 16000]; // 3 seconds
+        let wav = make_wav_bytes(&silence, 16000);
+        assert!(
+            decode_audio_bytes_shared_with_limit(Bytes::from(wav.clone()), 1.0).is_err(),
+            "3s audio must be rejected under a 1s cap"
+        );
+        assert!(
+            decode_audio_bytes_shared_with_limit(Bytes::from(wav), 10.0).is_ok(),
+            "3s audio must be accepted under a 10s cap"
+        );
+    }
+
+    #[test]
+    fn test_duration_cap_checked_at_source_rate() {
+        // The budget scales with the source rate, so the cap means real
+        // seconds. The discriminating case is a 48 kHz file *under* the cap:
+        // 0.9 s is 43200 source samples, which a budget mistakenly computed
+        // against 16 kHz (16000 samples) would reject.
+        let under: Vec<i16> = vec![0; 43_200]; // 0.9s at 48kHz
+        let wav = make_wav_bytes(&under, 48000);
+        assert!(
+            decode_audio_bytes_shared_with_limit(Bytes::from(wav), 1.0).is_ok(),
+            "0.9s of 48kHz audio must be accepted under a 1s cap"
+        );
+
+        // And the overrun aborts as soon as the budget is crossed — the
+        // reported duration is ~the cap, not the full file length, because the
+        // decode loop never gets that far.
+        let over: Vec<i16> = vec![0; 3 * 48000]; // 3 seconds at 48kHz
+        let wav = make_wav_bytes(&over, 48000);
+        let err = decode_audio_bytes_shared_with_limit(Bytes::from(wav), 1.0)
+            .expect_err("3s of 48kHz audio must be rejected under a 1s cap");
+        let too_long = err
+            .downcast_ref::<AudioTooLong>()
+            .expect("must be a typed AudioTooLong so callers can classify it");
+        assert_eq!(too_long.limit_s, 1.0);
+        assert!(
+            too_long.observed_s >= 1.0 && too_long.observed_s < 1.5,
+            "abort should fire just past the cap, got {}s",
+            too_long.observed_s
+        );
+    }
+
+    #[test]
+    fn test_parse_max_audio_duration_s_defaults_and_clamps() {
+        assert_eq!(parse_max_duration_s(None), DEFAULT_MAX_DURATION_S);
+        assert_eq!(parse_max_duration_s(Some("")), DEFAULT_MAX_DURATION_S);
+        assert_eq!(parse_max_duration_s(Some("0")), DEFAULT_MAX_DURATION_S);
+        assert_eq!(parse_max_duration_s(Some("-5")), DEFAULT_MAX_DURATION_S);
+        assert_eq!(parse_max_duration_s(Some("nope")), DEFAULT_MAX_DURATION_S);
+        assert_eq!(parse_max_duration_s(Some("nan")), DEFAULT_MAX_DURATION_S);
+        assert_eq!(parse_max_duration_s(Some("120")), 120.0);
+        assert_eq!(parse_max_duration_s(Some(" 3600 ")), 3600.0);
+        assert_eq!(
+            parse_max_duration_s(Some("999999")),
+            ABSOLUTE_MAX_DURATION_S
+        );
+    }
+
+    // --- windowed resampling (long-audio memory fix) ---
+
+    #[test]
+    fn test_windowed_resample_matches_one_shot() {
+        // The load-bearing guard for the incremental resample path: decoding a
+        // 48 kHz file window-by-window must produce the same samples as the
+        // untouched one-shot `resample()` reference. A swept sine exposes
+        // filter-history discontinuities that silence or a pure tone would hide,
+        // and the length is deliberately not a multiple of the window so the
+        // zero-padded tail is exercised.
+        let n = 200_000;
+        let pcm: Vec<i16> = (0..n)
+            .map(|i| {
+                let t = i as f32 / 48000.0;
+                let freq = 200.0 + 3000.0 * (i as f32 / n as f32);
+                ((t * freq * std::f32::consts::TAU).sin() * 12000.0) as i16
+            })
+            .collect();
+        let wav = make_wav_bytes(&pcm, 48000);
+
+        let via_decode = decode_audio_bytes_shared_with_limit(Bytes::from(wav), 60.0).unwrap();
+
+        let floats: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+        let via_one_shot = resample(&floats, SampleRate(48000), SampleRate(16000)).unwrap();
+
+        let common = via_decode.len().min(via_one_shot.len());
+        assert!(common > 60_000, "unexpectedly short output: {common}");
+        let max_diff = via_decode[..common]
+            .iter()
+            .zip(&via_one_shot[..common])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "windowed resample diverged from one-shot by {max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_decode_non_window_multiple_tail() {
+        // Length deliberately just past two full windows so the tail is tiny
+        // and the zero-padding trim is the only thing keeping the output honest.
+        let n = RESAMPLE_WINDOW_SAMPLES * 2 + 7;
+        let pcm: Vec<i16> = (0..n).map(|i| ((i % 400) as i16 - 200) * 40).collect();
+        let wav = make_wav_bytes(&pcm, 48000);
+        let out = decode_audio_bytes_shared_with_limit(Bytes::from(wav), 60.0).unwrap();
+        let expected = n / 3;
+        assert!(
+            out.len() <= expected,
+            "output {} must not exceed the ideal {expected} (padding not trimmed)",
+            out.len()
+        );
+        assert!(
+            expected - out.len() < 200,
+            "output {} is too far below the ideal {expected}",
+            out.len()
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn test_decode_16k_passthrough_unchanged() {
+        // No resampler is constructed at 16 kHz, so the decoded samples must
+        // survive bit-for-bit.
+        let pcm: Vec<i16> = (0..16000).map(|i| ((i % 300) as i16 - 150) * 100).collect();
+        let wav = make_wav_bytes(&pcm, 16000);
+        let out = decode_audio_bytes_shared_with_limit(Bytes::from(wav), 60.0).unwrap();
+        assert_eq!(out.len(), pcm.len());
+        for (i, (&got, &want)) in out.iter().zip(&pcm).enumerate() {
+            let expected = want as f32 / 32768.0;
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "sample {i}: got {got}, want {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_48k_stereo_output_length() {
+        // 3 seconds of 48 kHz stereo -> ~48000 mono samples at 16 kHz.
+        let frames = 3 * 48000;
+        let mut pcm: Vec<i16> = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = ((i % 500) as i16 - 250) * 50;
+            pcm.push(v);
+            pcm.push(-v); // opposite channel; mono mix should cancel toward 0
+        }
+        let wav = make_wav_bytes_stereo(&pcm, 48000);
+        let out = decode_audio_bytes_shared_with_limit(Bytes::from(wav), 60.0).unwrap();
+        let expected = 48000_usize;
+        assert!(
+            out.len().abs_diff(expected) < expected / 100,
+            "expected ~{expected} samples, got {}",
+            out.len()
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
     }
 }

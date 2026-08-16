@@ -180,9 +180,10 @@ Three-tier test architecture:
 ### Security
 - **Loopback bind by default.** `127.0.0.1` only; `--bind-all` / `GIGASTT_ALLOW_BIND_ANY=1` required for non-loopback.
 - **Origin allowlist.** Cross-origin callers denied by default; loopback origins always allowed. `--allow-origin` (repeatable) for explicit additions; `--cors-allow-any` for wildcard.
-- **Runtime limits configurable via CLI / env** (v0.7.0): `--idle-timeout-secs` (default 300), `--ws-frame-max-bytes` (512 KiB), `--body-limit-bytes` (50 MiB), `--pool-size` (4), `--max-session-secs` (3600), `--shutdown-drain-secs` (10).
+- **Runtime limits configurable via CLI / env** (v0.7.0): `--idle-timeout-secs` (default 300), `--ws-frame-max-bytes` (512 KiB), `--body-limit-bytes` (256 MiB), `--pool-size` (4), `--max-session-secs` (3600), `--shutdown-drain-secs` (10), `--pool-checkout-timeout-secs` (300), `--max-audio-duration-s` (3900), `--max-inference-secs` (1800), `--max-concurrent-uploads` (0 → `pool_size * 2`).
+- **Upload admission control.** A semaphore bounds how many `/v1/transcribe*` requests are resident at once. This is what actually caps memory: axum buffers each body whole *before* the handler runs, so the pool alone does not limit how many `body_limit_bytes` uploads are in flight. Raising `--body-limit-bytes` without raising this is an OOM.
 - **Per-IP rate limiting** (v0.8.0, opt-in): `--rate-limit-per-minute N` + `--rate-limit-burst` on `/v1/*` (`/health` exempt); HTTP 429 + `Retry-After` when exhausted.
-- **Pool saturation backpressure.** REST returns 503 + `Retry-After: 30`; WebSocket error includes `retry_after_ms: 30000`.
+- **Pool saturation backpressure.** REST returns 503 + `Retry-After`; WebSocket error includes `retry_after_ms`.
 - **SHA-256 verification + atomic rename** on both encoder/decoder/joiner model files and the optional speaker diarization model.
 - **Internal errors sanitized** — no path or model leakage to clients.
 - **Prometheus `/metrics`** (v0.8.0, opt-in via `--metrics`): `gigastt_http_requests_total`, `gigastt_http_request_duration_seconds`.

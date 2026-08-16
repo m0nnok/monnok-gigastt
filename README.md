@@ -174,11 +174,15 @@ Full protocol spec: [`docs/asyncapi.yaml`](docs/asyncapi.yaml)
 
 | HTTP | Code | When |
 |---|---|---|
-| 400 | `bad_request` | Invalid audio format or malformed request |
-| 413 | `payload_too_large` | File exceeds `--body-limit-bytes` (default 50 MiB) |
+| 400 | `empty_body` | Request body is empty |
+| 413 | `payload_too_large` | File exceeds `--body-limit-bytes` (default 256 MiB) |
+| 422 | `invalid_audio` | Audio could not be decoded |
+| 422 | `audio_too_long` | Audio exceeds `--max-audio-duration-s` (default 65 min) |
 | 429 | `rate_limit_exceeded` | Per-IP token bucket exhausted; `Retry-After` header included |
-| 503 | `pool_saturated` | All inference sessions busy; `Retry-After: 30` |
+| 500 | `inference_error` | Audio decoded but inference failed |
+| 503 | `timeout` | All inference sessions or upload slots busy; `Retry-After` included |
 | 503 | `pool_closed` | Server is shutting down, pool closed to new checkouts |
+| 504 | `inference_timeout` | Transcription exceeded `--max-inference-secs` |
 
 ```json
 // Example: pool saturation

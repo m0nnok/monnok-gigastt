@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Long-audio support (up to 65 minutes by default).** `--max-audio-duration-s`
+  / `GIGASTT_MAX_AUDIO_DURATION_S` replaces the hardcoded 10-minute cap, which
+  had been rejecting 25–30 minute recordings with a misleading 422 that blamed
+  the audio format.
+- **`--max-inference-secs`** (default 1800) — wall-clock budget for a single
+  transcription, checked cooperatively at chunk boundaries so the session
+  triplet is always returned to the pool. Exceeding it returns
+  504 `inference_timeout`.
+- **`--max-concurrent-uploads`** (default `pool_size * 2`) — admission control
+  for `/v1/transcribe*`. The pool bounds concurrent *inference*, but axum
+  buffers each request body whole before the handler runs, so this is what
+  bounds peak memory. Rejections return 503 + `Retry-After`.
+- **`GET /v1/models`** now reports `max_audio_duration_s` and `max_body_bytes`
+  so clients can check a file locally instead of uploading it to find out.
+- **Diarization instrumentation** — `offline_diarization` log line with
+  `elapsed_ms`, `rtf`, turn/segment counts and RSS delta, plus
+  `gigastt_audio_duration_seconds` and
+  `gigastt_upload_admission_rejections_total` metrics.
+
+### Changed
+
+- **`--body-limit-bytes` default raised 50 MiB → 256 MiB.** Covers an hour of
+  compressed audio (320 kbps ≈ 137 MiB) or 16 kHz mono WAV (≈ 110 MiB).
+  Uncompressed 48 kHz stereo (≈ 659 MiB/hour) is deliberately not covered.
+- **`--pool-checkout-timeout-secs` default raised 30 → 300.** With long files
+  holding sessions for tens of minutes, 30 s returned 503 whenever the server
+  was merely busy.
+- **`/v1/transcribe` error codes are now specific.** Previously every engine
+  failure collapsed into 422 `transcription_error`. Now: 422 `audio_too_long`
+  (with the observed length and the configured limit), 422 `invalid_audio`,
+  500 `inference_error`, 504 `inference_timeout`. Inference failures moving
+  from 422 to 500 is a behaviour change. Client-facing messages never echo the
+  underlying error chain, which can carry filesystem paths.
+- **`/v1/transcribe/stream`** applies the same classification and honours the
+  server's configured duration cap.
+
+### Fixed
+
+- **Decode no longer buffers the whole file at its source sample rate.**
+  Resampling now runs in fixed 32 KiB windows during the packet loop, so only
+  the 16 kHz result is held whole. Peak memory for an hour of 48 kHz stereo
+  drops from ~2.7 GB to ~231 MB and no longer scales with the source rate.
+  The `n_frames` capacity hint is clamped rather than discarded for long files,
+  removing the doubling-realloc spike.
+- **Word timestamp drift on chunked (>30 s) transcription.** `frame_offset` was
+  accumulated from a per-chunk estimate that ran one encoder frame short, losing
+  40 ms per 20 s chunk — about 7 s over an hour, which also misaligned words
+  against diarization turns. It is now anchored to the absolute sample position.
+
 ## [1.0.1] - 2026-05-06
 
 ### Changed

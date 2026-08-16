@@ -30,8 +30,19 @@ gigastt serve [OPTIONS]
                             Env: GIGASTT_IDLE_TIMEOUT_SECS.
   --ws-frame-max-bytes <B>  Max WS frame size [default: 524288 = 512 KiB].
                             Env: GIGASTT_WS_FRAME_MAX_BYTES.
-  --body-limit-bytes <B>    Max REST body size [default: 52428800 = 50 MiB].
+  --body-limit-bytes <B>    Max REST body size [default: 268435456 = 256 MiB].
                             Env: GIGASTT_BODY_LIMIT_BYTES.
+  --max-audio-duration-s <S>  Max accepted audio length [default: 3900 = 65 min].
+                            Rejected during decode with 422 audio_too_long.
+                            Env: GIGASTT_MAX_AUDIO_DURATION_S.
+  --max-inference-secs <S>  Wall-clock budget per transcription [default: 1800].
+                            0 = disabled. Exceeding it returns 504.
+                            Env: GIGASTT_MAX_INFERENCE_SECS.
+  --max-concurrent-uploads <N>  Uploads admitted at once [default: 0 = pool_size*2].
+                            Bounds peak RSS: axum buffers each body whole
+                            before the handler runs, so the pool alone does
+                            not limit how many uploads are resident.
+                            Env: GIGASTT_MAX_CONCURRENT_UPLOADS.
   --rate-limit-per-minute <N>  Per-IP rate limit (requests/min). 0 = off (default).
                             Applies to /v1/* only; /health is exempt.
                             Env: GIGASTT_RATE_LIMIT_PER_MINUTE.

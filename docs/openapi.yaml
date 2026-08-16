@@ -25,11 +25,20 @@ info:
     All defaults are configurable via CLI flags or environment variables
     (see `gigastt serve --help`):
 
-    - `--body-limit-bytes` (default 50 MiB) — max upload size
+    - `--body-limit-bytes` (default 256 MiB) — max upload size
+    - `--max-audio-duration-s` (default 3900 = 65 min) — max audio length
+    - `--max-inference-secs` (default 1800) — wall-clock budget per transcription
     - `--pool-size` (default 4) — concurrent inference sessions
+    - `--max-concurrent-uploads` (default 0 = `pool_size * 2`) — uploads admitted at once
     - `--rate-limit-per-minute` (default 0 = off) — per-IP token bucket
-    - File transcription cap: 10 minutes of audio
-    - Pool saturation: REST returns `503 Service Unavailable` + `Retry-After: 30`
+    - Pool saturation: REST returns `503 Service Unavailable` + `Retry-After`
+
+    `GET /v1/models` reports the effective `max_audio_duration_s` and
+    `max_body_bytes`, so a client can check a file locally before uploading it.
+
+    Note that `POST /v1/transcribe` is synchronous and emits nothing until the
+    transcript is complete — on CPU an hour of audio can take 10–30 minutes.
+    Any reverse proxy and HTTP client in the path needs timeouts above that.
 
     ## Error Responses
 
@@ -48,10 +57,12 @@ info:
     |--------|------|---------|
     | 400 | `empty_body` | Request body is empty |
     | 413 | `payload_too_large` | Body exceeds `--body-limit-bytes` |
-    | 422 | `transcription_error` | Audio decoded but inference failed |
     | 422 | `invalid_audio` | Audio could not be decoded |
-    | 503 | `timeout` | Pool saturated; retry after `Retry-After` |
+    | 422 | `audio_too_long` | Audio exceeds `--max-audio-duration-s` |
+    | 500 | `inference_error` | Audio decoded but inference failed |
+    | 503 | `timeout` | Pool or upload slots saturated; retry after `Retry-After` |
     | 503 | `pool_closed` | Server shutting down |
+    | 504 | `inference_timeout` | Transcription exceeded `--max-inference-secs` |
     | 404 | `metrics_disabled` | `/metrics` called without `--metrics` flag |
   license:
     name: MIT
@@ -128,8 +139,17 @@ paths:
         Upload an audio file and receive a complete transcription.
         Supports WAV, MP3, M4A/AAC, OGG/Vorbis, and FLAC.
 
-        The entire file is processed in a single inference session.
-        Max audio duration: 10 minutes.
+        The whole request is handled in a single inference session; audio past
+        ~30 seconds is transcribed in chunks internally, carrying decoder state
+        across them.
+
+        Max audio duration: `--max-audio-duration-s` (default 3900 s / 65 min),
+        reported by `GET /v1/models`.
+
+        **This endpoint is synchronous.** It sends no bytes until the transcript
+        is complete, which on CPU can be 10–30 minutes for an hour of audio.
+        Raise `proxy_read_timeout` on any reverse proxy and the client-side
+        request timeout accordingly.
       operationId: transcribeFile
       requestBody:
         required: true
@@ -184,9 +204,13 @@ paths:
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "422":
-          $ref: "#/components/responses/TranscriptionError"
+          $ref: "#/components/responses/UnprocessableAudio"
+        "500":
+          $ref: "#/components/responses/InferenceError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/InferenceTimeout"
 
   /v1/transcribe/stream:
     post:
@@ -243,6 +267,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "422":
+          $ref: "#/components/responses/UnprocessableAudio"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -303,6 +329,8 @@ components:
         - supported_formats
         - supported_rates
         - diarization
+        - max_audio_duration_s
+        - max_body_bytes
       properties:
         id:
           type: string
@@ -348,6 +376,17 @@ components:
           type: boolean
           example: false
           description: Whether speaker diarization is available
+        max_audio_duration_s:
+          type: number
+          format: double
+          example: 3900
+          description: |
+            Longest audio file accepted, in seconds. Check a file against this
+            locally rather than uploading it to discover a 422.
+        max_body_bytes:
+          type: integer
+          example: 268435456
+          description: Largest request body accepted, in bytes
 
     TranscribeResponse:
       type: object
@@ -435,15 +474,46 @@ components:
             error: "Request body exceeds the configured size limit"
             code: payload_too_large
 
-    TranscriptionError:
-      description: Transcription failed
+    UnprocessableAudio:
+      description: |
+        Audio was rejected. `invalid_audio` means it could not be decoded;
+        `audio_too_long` means it decoded fine but exceeds the server's
+        configured `--max-audio-duration-s` (see `GET /v1/models`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            invalid_audio:
+              summary: Undecodable input
+              value:
+                error: "Could not decode the audio. Supported formats: WAV, MP3, M4A/AAC, OGG, FLAC."
+                code: invalid_audio
+            audio_too_long:
+              summary: Past the duration cap
+              value:
+                error: "Audio is 4200s long; this server accepts up to 3900s. Split the recording or raise --max-audio-duration-s."
+                code: audio_too_long
+
+    InferenceError:
+      description: Audio decoded but inference failed
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
           example:
-            error: "Transcription failed. Check audio format."
-            code: transcription_error
+            error: "Transcription failed due to an internal error."
+            code: inference_error
+
+    InferenceTimeout:
+      description: Transcription exceeded the server's wall-clock budget
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "Transcription exceeded the server's time budget."
+            code: inference_timeout
 
     ServiceUnavailable:
       description: Server busy or shutting down

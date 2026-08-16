@@ -11,23 +11,35 @@ use tokio_tungstenite::tungstenite::Message;
 
 // ─── 1. REST oversized body ─────────────────────────────────────────────────
 
-/// POST /v1/transcribe with a body larger than the 50MB DefaultBodyLimit.
+/// POST /v1/transcribe with a body larger than the configured DefaultBodyLimit.
 /// Expects a 413 Payload Too Large with machine-readable code
 /// `payload_too_large` — the strict version of the previous `!= 200` assertion
 /// that was too permissive to catch regressions in the body-limit guard.
+///
+/// Runs against a server configured with a deliberately tiny 1 MiB limit rather
+/// than the 256 MiB default: the contract under test is "bodies over the limit
+/// are rejected", and asserting it with a quarter-gigabyte allocation in CI
+/// would cost far more than it proves.
 #[tokio::test]
 #[ignore]
 async fn test_rest_oversized_body_rejected() {
     let model_dir = common::model_dir();
-    let (port, shutdown) = common::start_server(&model_dir).await;
+    let (port, shutdown) = common::start_server_with_limits(
+        &model_dir,
+        gigastt::server::RuntimeLimits {
+            body_limit_bytes: 1024 * 1024,
+            ..Default::default()
+        },
+    )
+    .await;
 
     // Build a reqwest client that does NOT enforce its own body limit.
     let client = reqwest::Client::builder()
         .build()
         .expect("Failed to build reqwest client");
 
-    // 51 MB of zeros — just over the 50 MB server limit.
-    let oversized_body: Vec<u8> = vec![0u8; 51 * 1024 * 1024];
+    // 2 MiB of zeros — just over the server's configured 1 MiB limit.
+    let oversized_body: Vec<u8> = vec![0u8; 2 * 1024 * 1024];
 
     let response = client
         .post(format!("http://127.0.0.1:{port}/v1/transcribe"))
@@ -178,15 +190,25 @@ async fn test_ws_fifth_client_hangs() {
 
 // ─── 4. HTTP returns 503 when pool is saturated ─────────────────────────────
 
-/// Hold all 4 pool slots via WebSocket, then POST /v1/transcribe.
-/// The HTTP handler has a 30-second pool.checkout() timeout and returns 503.
+/// Hold all 4 pool slots via WebSocket, then POST /v1/transcribe and expect
+/// 503 + `code=timeout` once the checkout window expires.
 ///
-/// This test takes ~30 seconds to complete (the HTTP timeout duration).
+/// The window is configured explicitly rather than inherited from the default.
+/// The default is 300 s — sized for long files, where a short window would
+/// reject callers whenever the server was merely busy — and waiting that out
+/// in a test would prove nothing the 3 s version doesn't.
 #[tokio::test]
 #[ignore]
 async fn test_rest_saturated_pool_returns_503() {
     let model_dir = common::model_dir();
-    let (port, shutdown) = common::start_server(&model_dir).await;
+    let (port, shutdown) = common::start_server_with_limits(
+        &model_dir,
+        gigastt::server::RuntimeLimits {
+            pool_checkout_timeout_secs: 3,
+            ..Default::default()
+        },
+    )
+    .await;
 
     // Saturate the pool.
     let mut clients = Vec::new();
@@ -198,9 +220,10 @@ async fn test_rest_saturated_pool_returns_503() {
     let wav = common::generate_wav(1, 16000);
     let client = reqwest::Client::new();
 
-    // Allow 35 seconds so the 30-second server timeout has room to expire.
+    // Allow well over the 3-second server window so a genuine hang still fails
+    // the test rather than racing it.
     let response = tokio::time::timeout(
-        Duration::from_secs(35),
+        Duration::from_secs(30),
         client
             .post(format!("http://127.0.0.1:{port}/v1/transcribe"))
             .body(wav)

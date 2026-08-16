@@ -14,6 +14,14 @@ services:
       GIGASTT_ORT_INTRA_THREADS: "8"
       GIGASTT_DIARIZATION: "true"
       GIGASTT_ALLOW_ORIGIN: ${GIGASTT_ALLOW_ORIGIN}
+      # Long-call support: 65 min of audio, 256 MiB uploads, 30 min per job.
+      # The reverse proxy must allow at least as much — see docs/deployment.md
+      # ("Long audio behind a proxy"); in particular proxy_read_timeout must
+      # exceed pool checkout + inference, and client_max_body_size must be
+      # >= GIGASTT_BODY_LIMIT_BYTES.
+      GIGASTT_MAX_AUDIO_DURATION_S: "3900"
+      GIGASTT_BODY_LIMIT_BYTES: "268435456"
+      GIGASTT_MAX_INFERENCE_SECS: "1800"
     volumes:
       - gigastt-models:/home/gigastt/.gigastt/models
     healthcheck:
@@ -21,6 +29,12 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          # models (~600 MB) + in_flight x (body_limit + decoded 16 kHz buffer).
+          # See the RSS formula in docs/deployment.md.
+          memory: 4g
 
 volumes:
   gigastt-models:
